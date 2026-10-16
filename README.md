@@ -9,9 +9,12 @@ Made first of all for the author's own workflow and shared as-is: you are welcom
 
 > **Unofficial.** This project is not affiliated with, endorsed by or connected to Civitai. Please use it
 > moderately and respect the site's terms and the rights of model authors.
+>
 
 **Status: public beta (v0.28).** It works for the author, but it has been tested on very few
 machines. Bug reports are welcome (see below).
+
+<img width="962" height="772" alt="Civitai Grabber2" src="https://github.com/user-attachments/assets/d539b058-5a72-431f-a121-4077510800bc" />
 
 ## What you need
 
