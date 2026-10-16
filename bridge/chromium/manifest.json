@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "Civitai Grabber Bridge",
+  "version": "0.15.0",
+  "description": "Connects the Civitai Grabber program with your browser: adds Civitai pages to its list and reads pages for it with your login.",
+  "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyIjuFkGRAK/T/U2Lsig1m+nQ29fIXDanKBjwKILNUrBL864e+Hfny/qkiGgp2LooNo0Qmhq+eu3ZeeIJdrHWhXF+v57AX24WV4WMuJhK4ZBRl5RF4jDoM9iMLPZARL1Jzuuredi7pFdTnGQDmc0KFNzxixVaLokmftpEPLtWxQk7z7MdIaygkOjuFyK1oZskQA2sR3UrzjYzmd6wMoMIhU7vxlIXIZ6MwVOCVDIu94b3GF04WcQP4TniKCkFHN2wV5QUxQvC5AmavgJFRAXkUffpZF6IigDrMrkjSaxwkjl9HGHASsn5gbgD8bIW1W7r4+ISHaGJvZ1L/Pcd2m5DmQIDAQAB",
+  "permissions": [
+    "storage",
+    "contextMenus",
+    "notifications",
+    "tabs",
+    "alarms",
+    "scripting",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "https://*.civitai.com/*",
+    "https://*.civitai.red/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Civitai Grabber Bridge",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon-16.png",
+      "32": "icon-32.png",
+      "48": "icon-48.png",
+      "128": "icon.png"
+    }
+  },
+  "icons": {
+    "16": "icon-16.png",
+    "32": "icon-32.png",
+    "48": "icon-48.png",
+    "128": "icon.png"
+  }
+}

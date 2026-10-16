@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+  body { font: 13px sans-serif; width: 300px; padding: 10px; box-sizing: border-box; }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  #ver { font-weight: normal; color: #555; }
+  .ok { color: #1a7f37; } .wait { color: #c62828; font-weight: bold; } .err { color: #c62828; font-weight: bold; }
+  button { display: block; width: 100%; margin: 8px 0 0; padding: 7px 10px; font-size: 13px; cursor: pointer;
+           background: #2162be; color: #fff; border: 0; border-radius: 4px; }
+  button:hover { background: #1b4f99; }
+  button:active { background: #163f7a; }
+  button:disabled { background: #a9c1e6; cursor: not-allowed; }
+  label { display: block; margin-top: 14px; }
+  select { margin-left: 4px; }
+  small { color: #555; display: block; margin-top: 8px; white-space: normal; overflow-wrap: anywhere; }
+  #msg { margin-top: 8px; overflow-wrap: anywhere; }
+  small:empty, #msg:empty { display: none; }
+  #attention { margin-top: 12px; padding: 6px 8px; background: #fff6d6; border-left: 4px solid #e6a700; }
+  #attention h2 { font-size: 12px; margin: 0 0 4px; }
+  #attList { list-style: none; margin: 0; padding: 0; }
+  #attList li { margin: 4px 0; overflow-wrap: anywhere; }
+  #attList a { color: #0b4aa8; cursor: pointer; text-decoration: underline; }
+  #attList span { color: #555; }
+  #attClear { width: auto; display: inline-block; margin: 4px 0 0; padding: 3px 8px; font-size: 12px; }
+</style></head>
+<body>
+  <h1>Civitai Grabber Bridge <span id="ver"></span></h1>
+  <div id="status">…</div>
+  <div id="count"></div>
+  <div id="launchBox" style="display:none">
+    <div id="launchMsg" class="wait"></div>
+    <button id="launch" style="display:none">Start Civitai Grabber</button>
+  </div>
+  <div id="attention" style="display:none">
+    <h2>Needs attention</h2>
+    <ul id="attList"></ul>
+    <button id="attClear">Clear the list</button>
+  </div>
+  <button id="addPage">Add this page to the list</button>
+  <small id="addHint"></small>
+  <div id="msg"></div>
+  <label>Close tabs of finished links:
+    <select id="closeMode">
+      <option value="never">Never</option>
+      <option value="always">Always</option>
+      <option value="ask">Ask</option>
+    </select>
+  </label>
+  <small>Applies to pages you added with the buttons here or the right-click menu on a page. "Ask" shows one notification when a batch is done.</small>
+  <button id="closeNow" style="display:none"></button>
+  <small id="last"></small>
+  <small>Keep this browser open and logged in to Civitai while the Civitai Grabber script is running. Right-click a page or a link for the same "add" action.</small>
+  <script src="common.js"></script>
+<script src="popup.js"></script>
+</body></html>

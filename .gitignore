@@ -1,0 +1,9 @@
+# personal data and runtime files created next to the script - never publish these
+civitai_grabber_settings.json
+civitai_grabber.log
+civitai_grabber_history.jsonl
+civitai_grabber_host.json
+civitai_grabber_host_chromium.json
+civitai_grabber_launch.bat
+__pycache__/
+*.zip
