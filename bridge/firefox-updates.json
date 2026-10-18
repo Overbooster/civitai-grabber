@@ -1,0 +1,12 @@
+{
+  "addons": {
+    "civitai-grabber-bridge@local": {
+      "updates": [
+        {
+          "version": "0.15.1",
+          "update_link": "https://github.com/Overbooster/civitai-grabber/releases/download/v0.28/civitai-grabber-bridge-firefox-0.15.1.xpi"
+        }
+      ]
+    }
+  }
+}
