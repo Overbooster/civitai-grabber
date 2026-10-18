@@ -66,12 +66,9 @@ provides:
   
 **Installation** (the files are in the latest [Release](../../releases); the same code is in the `bridge` folder of this repository):
 
-- **Firefox, recommended:** download the signed `.xpi` file from the Release and open it in Firefox
-  (or `about:addons` -> gear icon -> *Install Add-on From File*). It is signed by Mozilla, so the
-  installation is permanent and survives restarts.
-- **Firefox, temporary / for trying the newest code:** open `about:debugging#/runtime/this-firefox` ->
-  *Load Temporary Add-on* -> pick `bridge/firefox/manifest.json` from this repository (or from an
-  unpacked zip). A temporary add-on disappears when Firefox is restarted.
+- **Firefox:** Use the installation method that matches the available download:
+  - **Signed `.xpi` available:** Download it from the latest [Release](../../releases) and open it in Firefox, or go to `about:addons` -> gear icon -> *Install Add-on From File* and select the `.xpi`. The Mozilla-signed extension stays installed after browser restarts.
+  - **Only source files available:** Download the repository ZIP and unpack it. Open `about:debugging#/runtime/this-firefox` in Firefox, click *Load Temporary Add-on*, and select `bridge/firefox/manifest.json` from the extracted folder. The extension works until Firefox is restarted, after which it must be loaded again.
 - **Chrome / Edge / Brave / Chromium:** unpack the Chromium zip from the Release (or use the folder
   `bridge/chromium` of this repository), open `chrome://extensions`, turn on *Developer mode*,
   *Load unpacked* and select that folder. The extension keeps a fixed ID, so the program recognises it
