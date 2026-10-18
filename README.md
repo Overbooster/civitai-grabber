@@ -63,15 +63,19 @@ provides:
 - the right-click items "Add link to Civitai Grabber list" and "Add this page to Civitai Grabber list";
 - a toolbar button (pin it through the browser's extensions menu) that sends the address of the current page to
   the list.
+  
+**Installation** (the files are in the latest [Release](../../releases); the same code is in the `bridge` folder of this repository):
 
-Installation:
-
-- **Chrome / Edge / Brave / Chromium:** open `chrome://extensions`, turn on *Developer mode*,
-  *Load unpacked* and select the folder `bridge/chromium`. The extension keeps a fixed ID, so the
-  program recognises it automatically. Do not delete or move that folder afterwards.
-- **Firefox:** open `about:debugging#/runtime/this-firefox` -> *Load Temporary Add-on* -> pick
-  `bridge/firefox/manifest.json`. A temporary add-on disappears when Firefox is restarted; a signed
-  version is planned.
+- **Firefox, recommended:** download the signed `.xpi` file from the Release and open it in Firefox
+  (or `about:addons` -> gear icon -> *Install Add-on From File*). It is signed by Mozilla, so the
+  installation is permanent and survives restarts.
+- **Firefox, temporary / for trying the newest code:** open `about:debugging#/runtime/this-firefox` ->
+  *Load Temporary Add-on* -> pick `bridge/firefox/manifest.json` from this repository (or from an
+  unpacked zip). A temporary add-on disappears when Firefox is restarted.
+- **Chrome / Edge / Brave / Chromium:** unpack the Chromium zip from the Release (or use the folder
+  `bridge/chromium` of this repository), open `chrome://extensions`, turn on *Developer mode*,
+  *Load unpacked* and select that folder. The extension keeps a fixed ID, so the program recognises it
+  automatically. Do not delete or move the folder afterwards.
 
 When the program is closed, the extension window offers a **Start Civitai Grabber** button; for this the
 program asks your permission once and adds a small entry for each browser it can launch from
