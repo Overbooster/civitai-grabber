@@ -9,12 +9,12 @@ Made first of all for the author's own workflow and shared as-is: you are welcom
 
 > **Unofficial.** This project is not affiliated with, endorsed by or connected to Civitai. Please use it
 > moderately and respect the site's terms and the rights of model authors.
->
 
-**Status: public beta (v0.28).** It works for the author, but it has been tested on very few
+
+**Status: public beta.** It works for the author, but it has been tested on very few
 machines. Bug reports are welcome (see below).
 
-<img width="962" height="772" alt="Civitai Grabber2" src="https://github.com/user-attachments/assets/d539b058-5a72-431f-a121-4077510800bc" />
+<img width="962" height="772" alt="Civitai Grabber screenshot" src="https://github.com/user-attachments/assets/d539b058-5a72-431f-a121-4077510800bc" />
 
 ## What you need
 
@@ -65,10 +65,9 @@ provides:
   the list.
   
 **Installation** (the files are in the latest [Release](../../releases); the same code is in the `bridge` folder of this repository):
-
-- **Firefox:** Use the installation method that matches the available download:
-  - **Signed `.xpi` available:** Download it from the latest [Release](../../releases) and open it in Firefox, or go to `about:addons` -> gear icon -> *Install Add-on From File* and select the `.xpi`. The Mozilla-signed extension stays installed after browser restarts.
-  - **Only source files available:** Download the repository ZIP and unpack it. Open `about:debugging#/runtime/this-firefox` in Firefox, click *Load Temporary Add-on*, and select `bridge/firefox/manifest.json` from the extracted folder. The extension works until Firefox is restarted, after which it must be loaded again.
+- **Firefox:** see which file the latest [Release](../../releases) contains for Firefox.
+  - A signed `.xpi` file: open it in Firefox (or `about:addons` -> gear icon -> *Install Add-on From File*). It is signed by Mozilla, so it stays installed after Firefox is restarted.
+  - A `.zip` file (a build that is not signed yet): open `about:debugging#/runtime/this-firefox`, click *Load Temporary Add-on* and select the downloaded `.zip` file. It works fully, but Firefox forgets it on restart, so repeat this after each restart.
 - **Chrome / Edge / Brave / Chromium:** unpack the Chromium zip from the Release (or use the folder
   `bridge/chromium` of this repository), open `chrome://extensions`, turn on *Developer mode*,
   *Load unpacked* and select that folder. The extension keeps a fixed ID, so the program recognises it
