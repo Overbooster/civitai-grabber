@@ -38,11 +38,21 @@ but it has been tested on very few machines. Bug reports are welcome (see below)
 The window has tooltips for every option. Settings can also be given in a plain text task file
 (see the comment at the top of `civitai_grabber.pyw`).
 
-**About signing in.** The sign-in is a read-only access (profile, models, media) that you can revoke at any time in
-your Civitai account (*Connected Apps*). `civitai.red` and `civitai.com` are interchangeable: a sign-in on either
-site works for links of both. While you are signed in, the API token is not used; the log of every run says which
-credentials were used and counts the requests, so you can see that the sign-in was enough. Signing in needs the
-local port 8765 to be free for a moment.
+## Two ways to authorize
+
+The program needs your Civitai account for some models and for reading image pages. There are two ways, and both can be set up at the same time:
+
+|  | Sign in with Civitai | API token |
+|---|---|---|
+| How | Press the button and allow the access in the browser tab | Create a key in Civitai (account settings -> API keys) and paste it |
+| Access | Read-only (profile, models, media), limited to this program | A personal key: treat it like a password |
+| Revoking | One click in your Civitai account (*Connected Apps*) | Delete the key in Civitai |
+| Renewal | Automatic (the access is renewed in the background every hour) | Not needed |
+| Stored in | `civitai_grabber_auth.json` | `civitai_grabber_settings.json` |
+| Log of a run | Shows your Civitai user name (hiding it is planned) | Does not show your user name |
+| Needs | A browser and the local port 8765 free for a moment | Nothing |
+
+**Which one is used?** If you are signed in, the sign-in is used and the API token is ignored; after you sign out, the token is used again. The log of every run says which credentials were used and counts the requests (for example "Credentials used: OAuth 120 request(s), API token 0"), and lists any request that was refused although you were signed in. `civitai.red` and `civitai.com` are interchangeable: a sign-in on either site works for links of both.
 
 ## Privacy
 
