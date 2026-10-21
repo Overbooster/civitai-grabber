@@ -7,7 +7,7 @@ const msg = $("msg");
 const addBtn = $("addPage");
 const addHint = $("addHint");
 const mode = $("closeMode");
-const closeNow = $("closeNow");
+const unchecked = new Set();   // tabs the user has unchecked in the "finished pages" list (all others are checked)
 
 // finished links whose page must be looked at again (some files were not downloaded)
 function labelOf(url) {
@@ -69,8 +69,34 @@ async function render() {
     delete $("launchMsg").dataset.busy;
   }
   renderAttention(s.attention || []);
-  closeNow.style.display = s.pending ? "block" : "none";
-  closeNow.textContent = s.pending ? `Close ${s.pending} tab(s) of finished links` : "";
+  renderPending(s.pendingList || []);
+}
+
+function renderPending(list) {
+  const box = $("pendingBox");
+  box.style.display = list.length ? "block" : "none";
+  const ul = $("pendList");
+  const key = JSON.stringify(list);
+  if (ul.dataset.key === key) return;        // nothing changed: do not rebuild (keeps the check boxes as they are)
+  ul.dataset.key = key;
+  ul.textContent = "";
+  for (const it of list) {
+    const li = document.createElement("li");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = !unchecked.has(it.tabId);
+    cb.id = "pend" + it.tabId;
+    cb.addEventListener("change", () => { if (cb.checked) unchecked.delete(it.tabId); else unchecked.add(it.tabId); });
+    const lab = document.createElement("label");
+    lab.htmlFor = cb.id;
+    lab.textContent = " " + (it.title || labelOf(it.url));
+    lab.title = it.url;
+    li.append(cb, lab);
+    ul.append(li);
+  }
+}
+function checkedTabs() {
+  return [...$("pendList").querySelectorAll("input")].filter((c) => c.checked).map((c) => Number(c.id.slice(4)));
 }
 
 $("launch").addEventListener("click", async () => {
@@ -105,7 +131,8 @@ addBtn.addEventListener("click", async () => {
 
 browser.storage.local.get("closeMode").then((r) => { mode.value = r.closeMode || "never"; });
 mode.addEventListener("change", () => browser.storage.local.set({ closeMode: mode.value }));
-closeNow.addEventListener("click", async () => { await rpc({ cmd: "closePending" }); closeNow.style.display = "none"; });
+$("pendClose").addEventListener("click", async () => { await rpc({ cmd: "closeSelected", ids: checkedTabs() }); render(); });
+$("pendKeep").addEventListener("click", async () => { await rpc({ cmd: "keepSelected", ids: checkedTabs() }); render(); });
 
 render();
 setInterval(render, 700);

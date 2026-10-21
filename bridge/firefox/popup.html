@@ -21,6 +21,13 @@
   #attList li { margin: 4px 0; overflow-wrap: anywhere; }
   #attList a { color: #0b4aa8; cursor: pointer; text-decoration: underline; }
   #attList span { color: #555; }
+  #pendingBox { margin-top: 12px; padding: 6px 8px; background: #eaf1fc; border-left: 4px solid #2162be; }
+  #pendingBox h2 { font-size: 12px; margin: 0 0 4px; }
+  #pendList { list-style: none; margin: 0; padding: 0; max-height: 150px; overflow-y: auto; }
+  #pendList li { margin: 3px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #pendList label { display: inline; margin: 0; cursor: pointer; }
+  button.alt { background: #fff; color: #2162be; border: 1px solid #2162be; }
+  button.alt:hover { background: #eaf1fc; }
   #attClear { width: auto; display: inline-block; margin: 4px 0 0; padding: 3px 8px; font-size: 12px; }
 </style></head>
 <body>
@@ -46,8 +53,13 @@
       <option value="ask">Ask</option>
     </select>
   </label>
-  <small>Applies to pages you added with the buttons here or the right-click menu on a page. "Ask" shows one notification when a batch is done.</small>
-  <button id="closeNow" style="display:none"></button>
+  <small>Applies to pages you added with the buttons here or the right-click menu on a page. "Ask" collects the finished pages in a list here (with a notification): you choose which to close and which to keep open.</small>
+  <div id="pendingBox" style="display:none">
+    <h2>Finished pages: close or keep open?</h2>
+    <ul id="pendList"></ul>
+    <button id="pendClose">Close checked</button>
+    <button id="pendKeep" class="alt">Keep checked open</button>
+  </div>
   <small id="last"></small>
   <small>Keep this browser open and logged in to Civitai while the Civitai Grabber script is running. Right-click a page or a link for the same "add" action.</small>
   <script src="common.js"></script>

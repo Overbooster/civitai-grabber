@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Civitai Grabber v0.28 - batch downloader for Civitai LoRA models and their example
+Civitai Grabber v0.35 - batch downloader for Civitai LoRA models and their example
 images/videos with generation metadata. Python 3.8+, standard library only
 (Tkinter is included in the Windows installer from python.org).
 
@@ -51,9 +51,13 @@ import datetime
 import urllib.request
 import urllib.parse
 import urllib.error
+import base64
+import hashlib
+import secrets
+import webbrowser
 from html.parser import HTMLParser
 
-VERSION = "0.28"
+VERSION = "0.35"
 
 # ======================================================================================================
 # SWITCHES - change True/False here, nothing else needs editing
@@ -78,7 +82,8 @@ SETTINGS = os.path.join(SCRIPT_DIR, "civitai_grabber_settings.json")
 
 BRIDGE_TIMEOUT = 90  # seconds to wait for one page from the browser
 
-STATE = {"log": None, "bridge_failures": 0, "bridge_off": False, "stop": None, "blocked": 0, "page_blocked": False, "model_folder": None, "model_name": None, "model_failed": False, "pillow_warned": False, "net_fail": 0, "net_down": False}
+STATE = {"log": None, "bridge_failures": 0, "bridge_off": False, "stop": None, "blocked": 0, "page_blocked": False, "model_folder": None, "model_name": None, "model_failed": False, "pillow_warned": False, "net_fail": 0, "net_down": False,
+         "made_dirs": [], "parts": set()}
 
 DEFAULTS = {"BRIDGE": "1", "TOKEN": "", "PATH": "", "PREFIX": "", "PICS": "4", "VIDEO": "1", "ORIGINAL": "1",
             "COMFY": "0", "EXISTING": "ask", "IMGFOLDER": "", "USE_SUBFOLDER": "0", "DSCR": "dscr.txt", "DSCR_AS_MODEL": "0", "MODEL": "1", "GALLERY": "0",
@@ -483,12 +488,14 @@ def _norm(path):
     return os.path.normcase(os.path.normpath(path)) if path else ""
 
 
-def history_add(key, url, folder, status, file=None):
+def history_add(key, url, folder, status, file=None, note=None):
     try:
+        rec = {"time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+               "key": key, "url": url, "folder": folder, "status": status, "file": file}
+        if note:
+            rec["note"] = note
         with open(HISTORY, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "key": key, "url": url, "folder": folder, "status": status, "file": file},
-                               ensure_ascii=False) + "\n")
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except OSError:
         pass
 
@@ -512,7 +519,288 @@ def history_find(key, folder=None):
 
 # ----------------------------------------------------------------- network
 
+# --------------------------------------------------------------------- Sign in with Civitai (OAuth 2.0 + PKCE)
+OAUTH_CLIENT_ID = "0ea2a070-d17a-45d9-a772-ba3938974d06"  # public client of this program (it has no secret: PKCE is used)
+OAUTH_PORT = 8765
+OAUTH_REDIRECT = "http://localhost:%d/oauth/callback" % OAUTH_PORT
+OAUTH_SCOPE = 37  # UserRead + ModelsRead + MediaRead: read-only
+AUTH_FILE = os.path.join(SCRIPT_DIR, "civitai_grabber_auth.json")
+SITES = ("civitai.red", "civitai.com")
+
+
+def site_of(url):
+    m = re.match(r"^https?://(?:[^/]*\.)?(civitai\.(?:red|com))(?:[:/]|$)", url or "")
+    return m.group(1) if m else None
+
+
+class _OAuthHandler(http.server.BaseHTTPRequestHandler):
+    result = {}
+    next_url = "https://civitai.red/"  # where the tab goes if the browser does not let a page close itself
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        u = urllib.parse.urlsplit(self.path)
+        if u.path != "/oauth/callback":
+            self.send_response(404)
+            self.end_headers()
+            return
+        _OAuthHandler.result.update({k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()})
+        body = ("<html><head><meta charset='utf-8'></head><body style='font-family:sans-serif'>"
+                "<h3>Civitai Grabber</h3><p>Signed in. This tab closes itself or opens Civitai in a moment; "
+                "you can return to the program.</p>"
+                "<script>setTimeout(function(){window.close();},400);"
+                "setTimeout(function(){location.href=%s;},1500);</script></body></html>" % json.dumps(_OAuthHandler.next_url)).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _post_form(url, fields):
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode(), method="POST",
+                                 headers={"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded",
+                                          "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=40) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            j = json.loads(e.read().decode("utf-8"))
+            raise RuntimeError("%s %s" % (j.get("error", e.code), j.get("error_description", "")))
+        except ValueError:
+            raise RuntimeError("HTTP %s" % e.code)
+
+
+class Auth:
+    """Keeps the OAuth sign-in (per site) and counts which credentials every request used, so the log can prove
+    whether the sign-in was enough or the API key was needed."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.sites = {}    # "civitai.red" -> {"refresh", "access", "exp", "user"}
+        self.issued = {}   # every access token handed out -> site (an old string still maps to the fresh one)
+        self.ep_cache = {}
+        self.running = False
+        self.counts = {"oauth": 0, "apikey": 0, "none": 0}
+        self.denied = []
+        self.kind = ""
+        self.load()
+
+    # ---- storage
+    def load(self):
+        try:
+            with open(AUTH_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        for site, d in (data.get("sites") or {}).items():
+            if site in SITES and d.get("refresh"):
+                self.sites[site] = {"refresh": d["refresh"], "access": "", "exp": 0, "user": d.get("user", "")}
+                SECRETS.add(d["refresh"])
+
+    def save(self):
+        data = {"sites": {s_: {"refresh": d["refresh"], "user": d.get("user", "")} for s_, d in self.sites.items()}}
+        try:
+            with open(AUTH_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=1)
+        except OSError:
+            pass
+
+    def signed_in(self):
+        return {s_: d.get("user", "") for s_, d in self.sites.items()}
+
+    def sign_out(self):
+        with self.lock:
+            self.sites.clear()
+            self.issued.clear()
+            self.save()
+
+    # ---- endpoints
+    def endpoints(self, site):
+        if site in self.ep_cache:
+            return self.ep_cache[site]
+        for base in ("https://auth.%s" % site, "https://%s" % site):
+            try:
+                j = json.loads(http_get(base + "/.well-known/openid-configuration", None, timeout=30, retries=1).decode("utf-8"))
+                if j.get("authorization_endpoint") and j.get("token_endpoint"):
+                    ep = {"authorize": j["authorization_endpoint"], "token": j["token_endpoint"], "userinfo": j.get("userinfo_endpoint")}
+                    self.ep_cache[site] = ep
+                    return ep
+            except Exception:  # noqa
+                pass
+        base = "https://%s/api/auth/oauth" % site  # civitai.red serves the sign-in paths directly
+        ep = {"authorize": base + "/authorize", "token": base + "/token", "userinfo": base + "/userinfo"}
+        self.ep_cache[site] = ep
+        return ep
+
+    # ---- sign in / refresh
+    def _store(self, site, j, user=None):
+        access = j.get("access_token")
+        if not access:
+            raise RuntimeError("no access token in the answer")
+        d = self.sites.setdefault(site, {"refresh": "", "access": "", "exp": 0, "user": ""})
+        d["access"] = access
+        d["exp"] = time.time() + float(j.get("expires_in") or 3600)
+        if j.get("refresh_token"):
+            d["refresh"] = j["refresh_token"]
+            SECRETS.add(d["refresh"])
+        if user:
+            d["user"] = user
+        SECRETS.add(access)
+        self.issued[access] = site
+        self.save()
+
+    def sign_in(self, site, log=None, open_browser=None, endpoints=None, timeout=240):
+        """Opens the Civitai consent page in the browser and waits for the answer. Returns the user name."""
+        log = log or (lambda m: None)
+        ep = endpoints or self.endpoints(site)
+        verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode()
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        state = secrets.token_urlsafe(16)
+        servers = []
+        for host in ("127.0.0.1", "::1"):  # "localhost" can mean either
+            try:
+                if host == "::1":
+                    class _S6(http.server.HTTPServer):
+                        address_family = socket.AF_INET6
+                    srv = _S6((host, OAUTH_PORT), _OAuthHandler)
+                else:
+                    srv = http.server.HTTPServer((host, OAUTH_PORT), _OAuthHandler)
+                srv.timeout = 0.5
+                servers.append(srv)
+            except OSError:
+                pass
+        if not servers:
+            raise RuntimeError("port %d is busy; close the program that uses it or use the API token" % OAUTH_PORT)
+        _OAuthHandler.result.clear()
+        _OAuthHandler.next_url = "https://%s/" % site
+        url = ep["authorize"] + "?" + urllib.parse.urlencode({
+            "response_type": "code", "client_id": OAUTH_CLIENT_ID, "redirect_uri": OAUTH_REDIRECT,
+            "scope": OAUTH_SCOPE, "state": state, "code_challenge": challenge, "code_challenge_method": "S256"})
+        log("Sign-in: the browser opens the Civitai page - press Allow")
+        (open_browser or webbrowser.open)(url)
+        t0 = time.time()
+        try:
+            while time.time() - t0 < timeout and not _OAuthHandler.result:
+                for srv in servers:
+                    srv.handle_request()
+        finally:
+            for srv in servers:
+                srv.server_close()
+        res = dict(_OAuthHandler.result)
+        if not res:
+            raise RuntimeError("no answer from the browser within %d seconds" % timeout)
+        if res.get("error"):
+            raise RuntimeError("Civitai refused: %s %s" % (res.get("error"), res.get("error_description", "")))
+        if res.get("state") != state or not res.get("code"):
+            raise RuntimeError("the answer of the browser does not match the request")
+        j = _post_form(ep["token"], {"grant_type": "authorization_code", "code": res["code"], "redirect_uri": OAUTH_REDIRECT,
+                                     "client_id": OAUTH_CLIENT_ID, "code_verifier": verifier})
+        user = ""
+        with self.lock:
+            self._store(site, j)
+            self.ep_cache.setdefault(site, ep)
+            try:
+                req = urllib.request.Request(ep["userinfo"], headers={"User-Agent": UA, "Authorization": "Bearer " + j["access_token"]})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    info = json.loads(r.read().decode("utf-8"))
+                user = info.get("preferred_username") or info.get("username") or info.get("name") or ""
+            except Exception:  # noqa
+                pass
+            self.sites[site]["user"] = user
+            self.save()
+        return user
+
+    def _refresh(self, site):
+        d = self.sites[site]
+        j = _post_form(self.endpoints(site)["token"], {"grant_type": "refresh_token", "refresh_token": d["refresh"],
+                                                         "client_id": OAUTH_CLIENT_ID})
+        self._store(site, j)
+
+    def _ensure(self, site):
+        d = self.sites[site]
+        if not d.get("access") or time.time() > d["exp"] - 300:
+            self._refresh(site)
+        self.issued[d["access"]] = site
+        return d["access"]
+
+    # ---- one run
+    def begin_run(self, urls, apikey, log):
+        """Chooses the credentials of the run. Returns the token string that the rest of the program passes around."""
+        with self.lock:
+            self.running = True
+            self.counts = {"oauth": 0, "apikey": 0, "none": 0}
+            self.denied = []
+            hosts = [h for h in (site_of(u) for u in urls) if h]
+            site = next((h for h in hosts if h in self.sites), None)
+            cross = None
+            if site is None and self.sites:  # signed in on the other Civitai site: it is the same account - try it and log the result
+                site = next(iter(self.sites))
+                cross = hosts[0] if hosts else None
+            if site:
+                try:
+                    token = self._ensure(site)
+                    self.kind = "oauth"
+                    who = self.sites[site].get("user") or "?"
+                    log("Credentials: Sign in with Civitai (%s on %s)%s. The API token is NOT used%s." % (
+                        who, site, (", used for %s links - the same account; the summary below shows whether it was accepted" % cross)
+                        if cross and cross != site else "", " (a token is saved but ignored)" if apikey else ""))
+                    return token
+                except Exception as e:  # noqa
+                    log("Credentials: the sign-in could not be renewed (%s) - please sign in again; using the API token" % e)
+            self.kind = "apikey" if apikey else "none"
+            log("Credentials: %s" % ("API token" if apikey else "none (no API token, not signed in) - some data may be unavailable"))
+            return apikey
+
+    def fresh(self, token):
+        """Called for every request: swaps an OAuth token for the current one (it lives one hour) and counts the use."""
+        with self.lock:
+            site = self.issued.get(token) if token else None
+            if site is None or site not in self.sites:
+                if self.running:
+                    self.counts["apikey" if token else "none"] += 1
+                return token
+            d = self.sites[site]
+            if time.time() > d["exp"] - 300:
+                try:
+                    self._refresh(site)
+                except Exception as e:  # noqa
+                    file_log("OAuth refresh failed: %r" % (e,))
+            if self.running:
+                self.counts["oauth"] += 1
+            return d["access"] or token
+
+    def tag(self):
+        return {"oauth": " [OAuth]", "apikey": " [API token]"}.get(self.kind, "") if self.running else ""
+
+    def note_error(self, code, url):
+        if self.running and self.kind == "oauth" and code in (401, 403):
+            self.denied.append("HTTP %s  %s" % (code, urllib.parse.urlsplit(str(url)).path[:80]))
+
+    def end_run(self, log):
+        with self.lock:
+            if not self.running:
+                return
+            c = self.counts
+            log("Credentials used: OAuth %d request(s), API token %d, public files without credentials %d" % (c["oauth"], c["apikey"], c["none"]))
+            if self.kind == "oauth":
+                if self.denied:
+                    log("Refused although signed in (HTTP 401/403): %d" % len(self.denied))
+                    for line in self.denied[:8]:
+                        log("   " + line)
+                else:
+                    log("The sign-in was enough: no request was refused for lack of rights.")
+            self.running = False
+
+
+AUTH = Auth()
+
+
 def http_get(url, token=None, timeout=60, retries=3):
+    token = AUTH.fresh(token)
     headers = {"User-Agent": UA, "Accept": "*/*"}
     if token:
         headers["Authorization"] = "Bearer " + token
@@ -815,6 +1103,7 @@ def fetch_page(url, token=None):
         STATE["bridge_failures"] = 0
         if r.get("status") == 200 and r.get("text"):
             file_log("page via browser bridge (%s): %s" % (r.get("via"), url))
+            STATE["page_route"] = "browser bridge (%s)" % (r.get("via") or "?")
             return r["text"]
         raise urllib.error.HTTPError(url, int(r.get("status") or 502), "via browser", None, None)
     return _fetch_page_direct(url, token)
@@ -822,6 +1111,7 @@ def fetch_page(url, token=None):
 
 def _fetch_page_direct(url, token=None):
     """Open an HTML page with browser-like headers. First without the API token, then with it."""
+    token = AUTH.fresh(token)
     base = {"User-Agent": UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9", "Upgrade-Insecure-Requests": "1",
@@ -872,15 +1162,91 @@ def sniff_ext(path, ctype=""):
             "video/mp4": ".mp4", "video/webm": ".webm"}.get(ctype, ".jpg")
 
 
+def ensure_dir(path):
+    """os.makedirs that remembers which folders this run has created (to offer removing them if they stay empty)."""
+    path = os.path.normpath(path)
+    new, p = [], path
+    while p and not os.path.isdir(p):
+        new.append(p)
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    os.makedirs(path, exist_ok=True)
+    for d in new:
+        if d not in STATE["made_dirs"]:
+            STATE["made_dirs"].append(d)
+
+
+def cleanup_after_run(log):
+    """At the end of a run: offer to delete incomplete (.part) files and the empty folders this run has created."""
+    parts = sorted(p for p in STATE["parts"] if os.path.exists(p))
+    gone = set(parts)
+    dirs = []
+    for d in sorted(set(STATE["made_dirs"]), key=len, reverse=True):  # the deepest first
+        try:
+            items = os.listdir(d)
+        except OSError:
+            continue
+        if all(os.path.join(d, x) in gone for x in items):
+            dirs.append(d)
+            gone.add(d)
+    if not parts and not dirs:
+        return
+    def short(path):
+        return "\\".join(path.replace("/", "\\").split("\\")[-3:])
+    lines = ["The run left some leftovers:", ""]
+    if parts:
+        lines.append("Incomplete files (%d):" % len(parts))
+        for pth in parts[:6]:
+            lines.append("   %s  (%.1f MB)" % (short(pth), os.path.getsize(pth) / 1048576))
+        if len(parts) > 6:
+            lines.append("   ... and %d more" % (len(parts) - 6))
+    if dirs:
+        lines.append("Empty folders (%d), created by this run:" % len(dirs))
+        for d in dirs[:6]:
+            lines.append("   %s" % short(d))
+        if len(dirs) > 6:
+            lines.append("   ... and %d more" % (len(dirs) - 6))
+    lines += ["", "Delete them?", "(An incomplete file can be resumed by downloading the same link again.)"]
+    fn = ASK_CLEANUP["fn"]
+    if not fn:
+        log("Leftovers: %d incomplete file(s), %d empty folder(s) - not removed" % (len(parts), len(dirs)))
+        return
+    if not fn("\n".join(lines)):
+        log("Leftovers kept: %d incomplete file(s), %d empty folder(s)" % (len(parts), len(dirs)))
+        return
+    for pth in parts:
+        try:
+            os.remove(pth)
+        except OSError as e:
+            log("  could not delete %s: %s" % (pth, e))
+    for d in dirs:
+        try:
+            os.rmdir(d)
+        except OSError as e:
+            log("  could not remove %s: %s" % (d, e))
+    STATE["parts"].clear()
+    log("Deleted: %d incomplete file(s), %d empty folder(s)" % (len(parts), len(dirs)))
+
+
+def safe_cleanup(log):
+    try:
+        cleanup_after_run(log)
+    except Exception as e:  # noqa
+        file_log("cleanup error: %r" % (e,))
+    AUTH.end_run(log)
+
+
 def download_file(url, dest, log, stop, token=None, attempts=5, auto_ext=False, name_ext=""):
     """Download into .part with retries and resume after a dropped connection.
     auto_ext=True: dest is a path WITHOUT extension; the extension is taken from the file content.
     The token goes into ?token=, not into a header: the header breaks the redirect to file storage.
     Returns the path of the finished file."""
     shown_url = url
-    if token:
-        url = url + ("&" if "?" in url else "?") + "token=" + urllib.parse.quote(token)
+    base_url = url
     tmp = dest + ".part"
+    STATE["parts"].add(tmp)
     ctype = ""
 
     def finish():
@@ -891,6 +1257,7 @@ def download_file(url, dest, log, stop, token=None, attempts=5, auto_ext=False, 
                 ext = name_ext
             final = dest + ext
         os.replace(tmp, final)
+        STATE["parts"].discard(tmp)
         TB["cur"] = 0.0
         file_log("download ok: %s  content-type=%s  size=%d  url=%s" %
                  (os.path.basename(final), ctype, os.path.getsize(final), shown_url))
@@ -899,6 +1266,8 @@ def download_file(url, dest, log, stop, token=None, attempts=5, auto_ext=False, 
     for attempt in range(1, attempts + 1):
         if stop.is_set():
             raise Stopped()
+        tok = AUTH.fresh(token)  # an OAuth token lives one hour: take the current one for every attempt
+        url = base_url + ("&" if "?" in base_url else "?") + "token=" + urllib.parse.quote(tok) if tok else base_url
         have = os.path.getsize(tmp) if os.path.exists(tmp) else 0
         headers = {"User-Agent": UA}
         if have:
@@ -1093,6 +1462,7 @@ _REPL = {"/": "-", "\\": "-", "|": "-", ":": " -", "*": "", "?": "", '"': "'", "
 _RESERVED = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} | {"LPT%d" % i for i in range(1, 10)}
 
 
+ASK_CLEANUP = {"fn": None}  # set by the window: asks Yes/No even after Stop was pressed
 CHOOSER = {"fn": None}  # set by the window: asks the user which model files of a version to download
 WEIGHT_EXT = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".sft")
 
@@ -1278,13 +1648,27 @@ def convert_webp(path, cfg, log):
             kw = {"quality": 95, "subsampling": 0, "optimize": True}
             if exif:
                 kw["exif"] = exif
-            rgb.save(out, "JPEG", **kw)
+            file_log("webp convert: %s, mode %s, %dx%d, exif %s bytes" % (os.path.basename(path), im.mode, im.size[0], im.size[1],
+                                                                       len(exif) if exif else 0))
+            try:
+                rgb.save(out, "JPEG", **kw)
+            except Exception as e:  # noqa  (a JPEG holds at most 64 KB of EXIF/ICC: the picture matters more than those blocks)
+                log("  the first JPG attempt failed (%s): converting again without the metadata blocks of the WebP" % e)
+                file_log("pillow %s; metadata keys of the webp: %s" % (getattr(__import__("PIL"), "__version__", "?"), sorted(im.info.keys())))
+                clean = Image.new("RGB", rgb.size)
+                clean.paste(rgb)
+                clean.save(out, "JPEG", quality=95, subsampling=0, optimize=True)
         os.remove(path)
         log("  converted WebP -> JPG: %s" % os.path.basename(out))
         return out
     except Exception as e:  # noqa
         log("  WebP conversion failed (%s), file kept as WebP" % e)
         file_log("webp convert error: %r" % (e,))
+        try:
+            if os.path.exists(out) and os.path.exists(path):
+                os.remove(out)  # no half-written JPG next to the WebP
+        except (OSError, NameError):
+            pass
         return path
 
 
@@ -1334,6 +1718,36 @@ def next_index(folder):
 
 
 # ---------------------------------------------- metadata from the image page
+
+def devalue_unflatten(values):
+    """The image pages keep their data in a compact 'devalue' form: a flat list in which every number is the position
+    of another item (objects, lists) - this turns it back into ordinary dicts and lists."""
+    memo = {}
+    special = {-1: None, -2: float("nan"), -3: float("inf"), -4: float("-inf"), -5: -0.0}
+
+    def hydrate(i):
+        if isinstance(i, int) and i < 0:
+            return special.get(i)
+        if i in memo:
+            return memo[i]
+        v = values[i]
+        if isinstance(v, list):
+            if v and isinstance(v[0], str):  # a special value (date, set, ...): kept as it is
+                memo[i] = v
+                return v
+            out = memo[i] = []
+            for x in v:
+                out.append(hydrate(x))
+            return out
+        if isinstance(v, dict):
+            out = memo[i] = {}
+            for k, x in v.items():
+                out[k] = hydrate(x)
+            return out
+        memo[i] = v
+        return v
+    return hydrate(0)
+
 
 def find_meta(o):
     if isinstance(o, dict):
@@ -1448,6 +1862,7 @@ def find_resources(o):
 
 def scrape_image_page(host, image_id, token, debug_dir=None):
     """Returns (meta | None, image_url | None, original_name | None, other_candidate_urls) from /images/ID."""
+    STATE["page_route"] = "direct request"
     raw = fetch_page("%s://%s/images/%s" % (SCHEME, host, image_id), token)
     data = None
     m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', raw, re.S)
@@ -1456,6 +1871,12 @@ def scrape_image_page(host, image_id, token, debug_dir=None):
             data = json.loads(m.group(1))
         except ValueError:
             data = None
+    try:  # since autumn 2026 the page data is a string in the "devalue" form
+        ts = data["props"]["pageProps"].get("trpcState") if isinstance(data, dict) else None
+        if isinstance(ts, str):
+            data["props"]["pageProps"]["trpcState"] = devalue_unflatten(json.loads(ts))
+    except Exception as e:  # noqa
+        file_log("could not decode the page data: %r" % (e,))
     meta = find_meta(data) if data is not None else None
     rec = find_image_rec(data, image_id) if data is not None else None
     name = find_name(data, image_id) if data is not None else None
@@ -1475,6 +1896,11 @@ def scrape_image_page(host, image_id, token, debug_dir=None):
         meta.setdefault("Resources", res)
     cands = build_image_urls(raw, rec, image_id)
     img_url = cands[0] if cands else None
+    if meta is None or img_url is None:  # tell the window log how the page was read (the details go to the log file)
+        (STATE.get("log") or file_log)("    image page %s: read by %s, %d KB; generation metadata: %s; image address: %s%s" % (
+            image_id, STATE.get("page_route", "?"), len(raw) // 1024, "found" if meta else "not found",
+            "found" if img_url else "not found",
+            "  (the page does not look like a normal image page)" if (img_url is None and "__NEXT_DATA__" not in raw) else ""))
     file_log("page %s: meta=%s name=%s candidates=%s og=%s" % (
         image_id, "yes" if meta else "no", name, cands,
         (re.search(r'og:image["\'][^>]*content=["\']([^"\']{0,200})', raw) or [None, None])[1]))
@@ -1700,7 +2126,7 @@ def process_model(url, cfg, log, stop, ask, next_is_image=False):
     if not primary and do_model:
         raise ValueError("this version has no files to download")
     picked = [primary] if primary else []
-    skip_note = "Model file skipped (Model file is unchecked)"
+    skip_note = "NO MODEL FILE: Model file is unchecked - only the examples and the description are downloaded"
     weights = [f for f in files if is_weight_file(f)]
     if do_model and len(weights) >= 2:
         if CHOOSER["fn"]:
@@ -1740,7 +2166,7 @@ def process_model(url, cfg, log, stop, ask, next_is_image=False):
         overwrite = True
     elif not do_model and str(cfg.get("EXISTING", "ask")).strip().lower() == "overwrite":
         overwrite = True
-    os.makedirs(folder, exist_ok=True)
+    ensure_dir(folder)
 
     if not do_model:
         log("  " + skip_note)
@@ -1820,7 +2246,10 @@ def process_model(url, cfg, log, stop, ask, next_is_image=False):
         log("  %s written (examples described: %d%s)" % (dname, len(entries), ", earlier image blocks kept" if keep else ""))
     else:
         log("  Description file skipped (its name is empty)")
-    history_add("model:%s" % vid, url, folder, "ok")
+    if not do_model:
+        log("  [NO MODEL FILE] this model was processed without its model file (the Model file option was off)")
+    history_add("model:%s" % vid, url, folder, "ok",
+                note=None if do_model else "examples only - model file NOT downloaded (Model file option was off)")
     gal_raw = str(cfg.get("GALLERY", "0")).strip().lower()
     gal_bad = 0
     if gal_raw not in ("", "0"):
@@ -1857,7 +2286,7 @@ def process_image(url, cfg, log, stop, ask):
                                               "under a new number)" % (iid, rec["time"], folder)):
         log("  SKIPPED: image already downloaded %s" % rec["time"])
         return "skipped"
-    os.makedirs(folder, exist_ok=True)
+    ensure_dir(folder)
 
     meta = img_url = name = info = None
     alts = []
@@ -1905,7 +2334,8 @@ def process_image(url, cfg, log, stop, ask):
             extra.append("Created: %s" % info["createdAt"])
     if not meta:
         if info:
-            extra.append("Note: the image page is blocked for scripts, generation metadata could not be read")
+            extra.append("Note: generation metadata could not be read from the image page" +
+                         (" (the page is blocked for scripts)" if STATE["page_blocked"] else ""))
         log("  WARNING: no generation metadata for this image")
     dname = dscr_name(cfg, STATE["model_name"] if STATE["model_folder"] else None)
     if dname:
@@ -2041,15 +2471,14 @@ def run_task(cfg, urls, log, stop, ask, done=None):
     log("Civitai Grabber v%s" % VERSION)
     log("Log file: %s" % LOGFILE)
     STATE.update({"log": log, "bridge_failures": 0, "bridge_off": False, "stop": stop, "blocked": 0, "page_blocked": False, "model_folder": None,
-                  "model_name": None, "model_failed": False, "pillow_warned": False, "net_fail": 0, "net_down": False})
+                  "model_name": None, "model_failed": False, "pillow_warned": False, "net_fail": 0, "net_down": False,
+                  "made_dirs": [], "parts": set()})
     cfg = {**DEFAULTS, **cfg}
     if cfg["TOKEN"]:
         SECRETS.add(cfg["TOKEN"])
     if not cfg["PATH"]:
         log("No output folder given (PATH).")
         return
-    if not cfg["TOKEN"]:
-        log("WARNING: no TOKEN given, some data/files may be unavailable.")
     try:
         os.makedirs(cfg["PATH"], exist_ok=True)
     except OSError as e:
@@ -2061,6 +2490,8 @@ def run_task(cfg, urls, log, stop, ask, done=None):
         if val and val not in ("all", "*") and not val.isdigit():
             log("%s must be a number, all, or empty (now: %r)." % (label, val))
             return
+    STATE["made_dirs"], STATE["parts"] = [], set()
+    cfg["TOKEN"] = AUTH.begin_run(urls, cfg["TOKEN"], log)
     log("Links in the task: %d" % len(urls))
     TB.update({"phase": "connecting", "failed": 0, "total": len(urls), "idx": 0, "cur": 0.0})
     seen = {}  # link key -> finished OK?
@@ -2074,6 +2505,7 @@ def run_task(cfg, urls, log, stop, ask, done=None):
     for i, u in enumerate(urls, 1):
         if stop.is_set():
             log("Stopped.")
+            safe_cleanup(log)
             return
         log("[%d/%d] %s" % (i, len(urls), u))
         TB["idx"], TB["cur"] = i - 1, 0.0
@@ -2106,6 +2538,7 @@ def run_task(cfg, urls, log, stop, ask, done=None):
                 log("  ATTENTION: %s - the browser page of this link stays open and is marked in the extension window" % note)
         except Stopped:
             log("Stopped.")
+            safe_cleanup(log)
             return
         except urllib.error.HTTPError as e:
             hint = ""
@@ -2113,7 +2546,8 @@ def run_task(cfg, urls, log, stop, ask, done=None):
                 hint = " - the model may be paid (buzz) or in early access, or the token is not accepted"
             elif e.code == 404:
                 hint = " - page/model not found or hidden"
-            log("  HTTP ERROR %s: %s%s  (...%s)" % (e.code, e.reason, hint, str(e.url)[-70:]))
+            AUTH.note_error(e.code, e.url)
+            log("  HTTP ERROR %s: %s%s  (...%s)%s" % (e.code, e.reason, hint, str(e.url)[-70:], AUTH.tag()))
             file_log("HTTPError %s %s" % (e.code, e.url))
             history_add(k, u, cfg["PATH"], "error HTTP %s" % e.code)
         except Exception as e:  # noqa
@@ -2133,6 +2567,7 @@ def run_task(cfg, urls, log, stop, ask, done=None):
             group["ok"] = False
         time.sleep(0.7)
     close_group()
+    safe_cleanup(log)
     log("Done.")
 
 
@@ -2337,6 +2772,7 @@ def main_gui():
 
     q = queue.Queue()
     ask_q = queue.Queue()
+    auth_q = queue.Queue()  # things the sign-in thread wants done in the window
     choose_q = queue.Queue()
     done_q = queue.Queue()
     stop = threading.Event()
@@ -2364,6 +2800,8 @@ def main_gui():
     e_token.pack(side="left", ipady=2)
     lock_btn = ttk.Button(row_tk, text="Lock", width=9)
     lock_btn.pack(side="left", padx=(6, 0))
+    signin_btn = ttk.Button(row_tk, text="Sign in with Civitai", width=24)
+    signin_btn.pack(side="left", padx=(6, 0))
     cb_bridge = ttk.Checkbutton(row_tk, text="Browser bridge", variable=b["BRIDGE"])
     cb_bridge.pack(side="right")
     bridge_lbl = ttk.Label(row_tk, text="", width=26, anchor="e")
@@ -2514,6 +2952,8 @@ def main_gui():
     for widget, text in (
             (e_token, "Your Civitai API key (account settings, API keys). Saved in civitai_grabber_settings.json next to the script."),
             (lock_btn, "Lock the token field against accidental edits / unlock it to change the token."),
+            (signin_btn, "Sign in with your Civitai account instead of pasting an API token. While you are signed in the "
+                         "API token is not used (the log says which credentials every run used). Needs a free local port 8765."),
             (path_combo, "Category folder: the place for one kind of models (characters, styles, poses ...). "
                          "Every model gets its own subfolder here, named after the model. "
                          "The drop-down list holds the 12 most recently used folders."),
@@ -2561,6 +3001,59 @@ def main_gui():
     def set_lock(lock):
         e_token.configure(state="readonly" if lock else "normal")
         lock_btn.configure(text="Unlock" if lock else "Lock")
+
+    def refresh_signin_ui():
+        si = AUTH.signed_in()
+        if si:
+            who = ", ".join((u or "?") for u in si.values())
+            signin_btn.configure(state="normal", text=("Sign out: %s" % who)[:30])
+        else:
+            signin_btn.configure(state="normal", text="Sign in with Civitai")
+
+    def ask_site():
+        """Small modal window: which Civitai site to sign in to. Returns 'civitai.red', 'civitai.com' or None."""
+        win = tk.Toplevel(root)
+        win.title("Sign in with Civitai")
+        win.transient(root)
+        first = next((site_of(x) for x in current_links() if site_of(x)), None)
+        var = tk.StringVar(value=first or "civitai.red")
+        ttk.Label(win, text="Which site do you use?").pack(anchor="w", padx=14, pady=(12, 4))
+        for site in SITES:
+            ttk.Radiobutton(win, text=site, value=site, variable=var).pack(anchor="w", padx=24)
+        res = {"v": None}
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=14, pady=12)
+        ttk.Button(bar, text="Cancel", command=win.destroy).pack(side="right")
+        ttk.Button(bar, text="Sign in", command=lambda: (res.update(v=var.get()), win.destroy())).pack(side="right", padx=6)
+        win.grab_set()
+        root.wait_window(win)
+        return res["v"]
+
+    def do_signin():
+        if AUTH.signed_in():
+            if messagebox.askyesno("Civitai Grabber", "Sign out?\n\nThe program will use the API token again "
+                                   "(you can also revoke the access in your Civitai account: Connected Apps)."):
+                AUTH.sign_out()
+                refresh_signin_ui()
+                log("Signed out.")
+            return
+        site = ask_site()
+        if not site:
+            return
+        signin_btn.configure(state="disabled", text="Waiting for the browser ...")
+
+        def work():
+            try:
+                user = AUTH.sign_in(site, log=log)
+            except Exception as e:  # noqa
+                err = str(e)
+                file_log("sign-in failed: %r" % (e,))
+                auth_q.put(lambda: (refresh_signin_ui(), log("Sign-in failed: %s" % err),
+                                    messagebox.showerror("Civitai Grabber", "Sign-in failed:\n%s" % err)))
+            else:
+                auth_q.put(lambda: (refresh_signin_ui(), log("Signed in as %s on %s. From now on the sign-in is used "
+                                                            "instead of the API token." % (user or "?", site))))
+        threading.Thread(target=work, daemon=True).start()
 
     def push_recent(key, value):
         value = (value or "").strip()
@@ -2905,6 +3398,14 @@ def main_gui():
                 return False
         return holder.get("ans", False)
 
+    def ask_cleanup(msg):
+        ev, holder = threading.Event(), {}
+        ask_q.put((msg, holder, ev))
+        ev.wait(300)
+        return holder.get("ans", False)
+
+    ASK_CLEANUP["fn"] = ask_cleanup
+
     def show_chooser(title, rows, default):
         """Modal list with the files of one model version; returns the indices of the ticked files (may be empty)."""
         win = tk.Toplevel(root)
@@ -2996,6 +3497,11 @@ def main_gui():
         return "connected" if BRIDGE.connected() else "waiting for the extension"
 
     def pump():
+        try:
+            while True:
+                auth_q.get_nowait()()
+        except queue.Empty:
+            pass
         try:
             while True:
                 msg = q.get_nowait()
@@ -3133,6 +3639,18 @@ def main_gui():
             if not messagebox.askyesno("Civitai Grabber", "The description file name is empty: no description and no "
                                                           "generation metadata will be written.\n\nContinue anyway?"):
                 return
+        n_models = sum(1 for u in urls if re.search(r"/models/\d+", u))
+        if not flag(cfg, "MODEL") and n_models:
+            ans = messagebox.askyesnocancel(
+                "Civitai Grabber",
+                "The \"Model file\" option is OFF.\n\n%d link(s) in the list lead to models: only their examples and "
+                "description will be downloaded, without the model files.\n\n"
+                "Yes - turn \"Model file\" ON and start\nNo - start without model files\nCancel - go back" % n_models)
+            if ans is None:
+                return
+            if ans:
+                b["MODEL"].set(True)
+                cfg = collect_cfg()
         need_pillow = False
         if cfg["WEBP2JPG"] == "1":
             try:
@@ -3156,6 +3674,8 @@ def main_gui():
         log("Stopping after the current step…")
 
     lock_btn.configure(command=lambda: set_lock(str(e_token.cget("state")) != "readonly"))
+    signin_btn.configure(command=do_signin)
+    refresh_signin_ui()
     browse_btn.configure(command=browse_dir)
     sample_btn.configure(command=create_sample)
     load_btn.configure(command=load_txt)

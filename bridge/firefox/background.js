@@ -292,8 +292,29 @@ function askNotify() {
   if (!n) return;
   browser.notifications.create("close-tabs", {
     type: "basic", title: "Civitai Grabber", iconUrl: browser.runtime.getURL("icon.png"),
-    message: `${n} browser tab(s) of finished links. Click here to close them (or use the toolbar button).`,
+    message: `${n} browser tab(s) of finished links are waiting. Click here (or the toolbar button) to choose which to close and which to keep.`,
   }).catch(() => {});
+}
+// the tabs waiting for the user's decision, with their titles (the popup shows them as a list of check boxes)
+async function pendingItems() {
+  const out = [];
+  for (const e of pendingClose.slice()) {
+    let title = "";
+    try { title = (await browser.tabs.get(e.tabId)).title || ""; } catch (err) { /* the tab is gone */ }
+    out.push({ tabId: e.tabId, url: e.url, title });
+  }
+  return out;
+}
+// close (doClose) or just stop asking about (keep open) the chosen tabs
+async function resolvePending(ids, doClose) {
+  await ready;
+  const set = new Set(ids);
+  const take = pendingClose.filter((e) => set.has(e.tabId));
+  for (let i = pendingClose.length - 1; i >= 0; i--) if (set.has(pendingClose[i].tabId)) pendingClose.splice(i, 1);
+  saveState();
+  const n = doClose ? await closeTabEntries(take) : take.length;
+  if (!pendingClose.length) browser.notifications.clear("close-tabs").catch(() => {});
+  return n;
 }
 async function closePending() {
   await ready;
@@ -303,7 +324,10 @@ async function closePending() {
   browser.notifications.clear("close-tabs").catch(() => {});
   return n;
 }
-browser.notifications.onClicked.addListener((id) => { if (id === "close-tabs") closePending(); });
+browser.notifications.onClicked.addListener(async (id) => {
+  if (id !== "close-tabs") return;
+  try { await (browser.action || browser.browserAction).openPopup(); } catch (e) { /* the browser did not allow it: the toolbar button does the same */ }
+});
 
 function removeAttention(url) {
   const i = attention.findIndex((a) => a.url === url);
@@ -378,7 +402,7 @@ async function handleCommand(m) {
     case "state": {
       if (!base) await findServer();   // fresh answer right after the worker has been started
       const li = await browser.storage.local.get(["seen", "launcher"]);
-      return { info: { ...info }, pending: pendingClose.length, attention, seen: !!li.seen, launcher: !!li.launcher };
+      return { info: { ...info }, pending: pendingClose.length, pendingList: await pendingItems(), attention, seen: !!li.seen, launcher: !!li.launcher };
     }
     case "add":
       try { return await addUrls(m.urls || [], m.tab); }
@@ -387,6 +411,10 @@ async function handleCommand(m) {
       try { await launchGrabber(); return { ok: true }; } catch (e) { return { error: String(e.message || e) }; }
     case "closePending":
       return { closed: await closePending() };
+    case "closeSelected":
+      return { closed: await resolvePending(m.ids || [], true) };
+    case "keepSelected":
+      return { kept: await resolvePending(m.ids || [], false) };
     case "openAttention":
       await openAttention(m.url);
       return { ok: true };

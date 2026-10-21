@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Civitai Grabber Bridge",
-  "version": "0.15.1",
+  "version": "0.16.0",
   "description": "Connects the Civitai Grabber program with your browser: adds Civitai pages to its list and reads pages for it with your login.",
   "permissions": [
     "storage",
@@ -23,12 +23,12 @@
   "browser_action": {
     "default_title": "Civitai Grabber Bridge",
     "default_popup": "popup.html",
-    "default_icon": {"48": "icon.png", "96": "icon.png"}
+    "default_icon": {"16": "icon-16.png", "32": "icon-32.png", "48": "icon-48.png", "128": "icon.png"}
   },
   "browser_specific_settings": {
     "gecko": {"id": "civitai-grabber-bridge@local", "strict_min_version": "91.0",
     "update_url": "https://raw.githubusercontent.com/Overbooster/civitai-grabber/main/bridge/firefox-updates.json",
     "data_collection_permissions": { "required": ["none"] }}
   },
-  "icons": {"48": "icon.png", "96": "icon.png"}
+  "icons": {"16": "icon-16.png", "32": "icon-32.png", "48": "icon-48.png", "128": "icon.png"}
 }
