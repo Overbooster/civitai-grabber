@@ -362,6 +362,10 @@ async function handleEvent(job) {
     notify(`${job.note || "Some files were not downloaded"} - the page stays open; see "Needs attention" in the extension window.`);
     return;
   }
+  if (job.event === "dismiss") {            // the user dropped the link in the program: take its mark off (the tab is left alone)
+    if (key && attention.some((a) => a.url === key)) { removeAttention(key); saveState(); updateBadge(); }
+    return;
+  }
   if (job.event !== "finished") return;
   if (key && attention.some((a) => a.url === key)) { removeAttention(key); updateBadge(); }
   let sk = key && sentTabs.has(key) ? key : undefined;      // the program may report the link a little differently than it was added

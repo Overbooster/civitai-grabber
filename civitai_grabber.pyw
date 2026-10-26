@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Civitai Grabber v0.35 - batch downloader for Civitai LoRA models and their example
+Civitai Grabber v0.40 - batch downloader for Civitai LoRA models and their example
 images/videos with generation metadata. Python 3.8+, standard library only
 (Tkinter is included in the Windows installer from python.org).
 
@@ -22,6 +22,8 @@ Settings can be entered in the window or given in a txt task file:
     DSCR: dscr.txt         description file name (.txt or .md; no extension = .txt)
     DSCR_AS_MODEL: 0       1 = name the description file after the model (extension taken from DSCR)
     WEBP2JPG: 0            1 = convert downloaded WebP images to JPG (needs: py -m pip install pillow)
+    RENAME_ID: 0           1 = a model file with an ID-like name (26 random characters, e.g. from the Civitai trainer) is saved under the
+                           model title (plus the version name when the model has several versions); the original name goes to the description
     EXISTING: ask          ask / skip / overwrite - what to do if already downloaded
     USE_SUBFOLDER: 0       1 = save single images (/images/ID) into IMGFOLDER (only when no model link
                            came before them in the same run; otherwise they go to that model's folder)
@@ -38,6 +40,8 @@ import re
 import socket
 import sys
 import json
+import struct
+import zlib
 import time
 import html
 import queue
@@ -57,7 +61,7 @@ import secrets
 import webbrowser
 from html.parser import HTMLParser
 
-VERSION = "0.35"
+VERSION = "0.40"
 
 # ======================================================================================================
 # SWITCHES - change True/False here, nothing else needs editing
@@ -87,7 +91,7 @@ STATE = {"log": None, "bridge_failures": 0, "bridge_off": False, "stop": None, "
 
 DEFAULTS = {"BRIDGE": "1", "TOKEN": "", "PATH": "", "PREFIX": "", "PICS": "4", "VIDEO": "1", "ORIGINAL": "1",
             "COMFY": "0", "EXISTING": "ask", "IMGFOLDER": "", "USE_SUBFOLDER": "0", "DSCR": "dscr.txt", "DSCR_AS_MODEL": "0", "MODEL": "1", "GALLERY": "0",
-            "WEBP2JPG": "0"}
+            "WEBP2JPG": "0", "RENAME_ID": "0"}
 
 
 SECRETS = set()  # strings (the API token) that must never appear in a log
@@ -744,9 +748,9 @@ class Auth:
                 try:
                     token = self._ensure(site)
                     self.kind = "oauth"
-                    who = self.sites[site].get("user") or "?"
-                    log("Credentials: Sign in with Civitai (%s on %s)%s. The API token is NOT used%s." % (
-                        who, site, (", used for %s links - the same account; the summary below shows whether it was accepted" % cross)
+                    # the Civitai user name is deliberately not written to the log (logs get posted in bug reports)
+                    log("Credentials: Sign in with Civitai (on %s)%s. The API token is NOT used%s." % (
+                        site, (", used for %s links - the same account; the summary below shows whether it was accepted" % cross)
                         if cross and cross != site else "", " (a token is saved but ignored)" if apikey else ""))
                     return token
                 except Exception as e:  # noqa
@@ -754,6 +758,19 @@ class Auth:
             self.kind = "apikey" if apikey else "none"
             log("Credentials: %s" % ("API token" if apikey else "none (no API token, not signed in) - some data may be unavailable"))
             return apikey
+
+    def peek(self, url, apikey):
+        """The token for a request made outside a run (the link check): the sign-in of that site (or the other one - it is
+        the same account), else the API token. Touches no run counters."""
+        with self.lock:
+            host = site_of(url)
+            site = host if host in self.sites else next(iter(self.sites), None)
+            if site:
+                try:
+                    return self._ensure(site)
+                except Exception as e:  # noqa
+                    file_log("check: the sign-in could not be renewed: %r" % (e,))
+        return apikey
 
     def fresh(self, token):
         """Called for every request: swaps an OAuth token for the current one (it lives one hour) and counts the use."""
@@ -1134,8 +1151,427 @@ def _fetch_page_direct(url, token=None):
     raise last
 
 
+def _png_rgba(w, h, rows):
+    raw = b"".join(b"\x00" + r for r in rows)
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def chain_icon_png(linked, k=1.0):
+    """The 'link' icon: two rings; joined by a bar when linked, apart and paler when not. Drawn here (no image files),
+    anti-aliased by supersampling. k scales it for high-resolution screens."""
+    W, H, ss = int(round(30 * k)), int(round(16 * k)), 4
+    color = (60, 60, 60) if linked else (150, 150, 150)
+
+    def inside(x, y):
+        x, y = x / k, y / k
+        for cx in (8.0, 22.0):
+            d2 = (x - cx) ** 2 + (y - 8.0) ** 2
+            if 4.1 ** 2 <= d2 <= 6.0 ** 2:
+                return True
+        return linked and 8.0 <= x <= 22.0 and 7.05 <= y <= 8.95
+
+    rows = []
+    for y in range(H):
+        row = bytearray()
+        for x in range(W):
+            n = sum(1 for sy in range(ss) for sx in range(ss) if inside(x + (sx + 0.5) / ss, y + (sy + 0.5) / ss))
+            row += bytes((color[0], color[1], color[2], int(255 * n / (ss * ss))))
+        rows.append(bytes(row))
+    return _png_rgba(W, H, rows)
+
+
+
 def get_json(url, token=None):
     return json.loads(http_get(url, token).decode("utf-8"))
+
+
+
+# ---- which model does a folder belong to? (a hidden marker file; old folders: the description file)
+MARKER = ".civitai-model.json"
+
+
+def _head(path, n=12000):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(n)
+    except OSError:
+        return ""
+
+
+def dscr_owner(path):
+    """The model id named in a description file written by this program (Model ID line, else the Page address), or None."""
+    head = _head(path)
+    if not re.search(r"^(?:- \*\*)?File:", head, re.M):
+        return None
+    m = (re.search(r"^(?:- \*\*)?Model ID:(?:\*\*)?\s*(\d+)", head, re.M)
+         or re.search(r"^(?:- \*\*)?Page:(?:\*\*)?\s*\S*/models/(\d+)", head, re.M))
+    return m.group(1) if m else None
+
+
+def folder_model_ids(folder):
+    """Ids of the models a folder is known to hold: the marker file, else the description files in it. Empty set = unknown."""
+    ids = set()
+    try:
+        with open(os.path.join(folder, MARKER), encoding="utf-8") as f:
+            data = json.load(f)
+        ids.add(str(data.get("modelId")))
+        ids.update(str(x.get("modelId")) for x in data.get("others", []) if isinstance(x, dict))
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    ids.discard("None")
+    if ids:
+        return ids
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return ids
+    for n in names:
+        if n.lower().endswith((".txt", ".md")):
+            owner = dscr_owner(os.path.join(folder, n))
+            if owner:
+                ids.add(owner)
+    return ids
+
+
+def write_marker(folder, model_id, vid, name, url):
+    """A small hidden file in the model folder: which model (and versions) it holds. Another model in the same folder is added to 'others'."""
+    path = os.path.join(folder, MARKER)
+    data = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    mid = str(model_id)
+    if data.get("modelId") in (None, mid):
+        data["modelId"] = mid
+        data["name"], data["page"] = name, url
+        data["versionIds"] = sorted({str(x) for x in data.get("versionIds", [])} | {str(vid)})
+    else:
+        others = [o for o in data.get("others", []) if isinstance(o, dict)]
+        rec = next((o for o in others if str(o.get("modelId")) == mid), None)
+        if rec is None:
+            rec = {"modelId": mid, "name": name, "page": url, "versionIds": []}
+            others.append(rec)
+        rec["versionIds"] = sorted({str(x) for x in rec.get("versionIds", [])} | {str(vid)})
+        data["others"] = others
+    try:
+        if os.path.exists(path) and sys.platform == "win32":
+            import ctypes
+            ctypes.windll.kernel32.SetFileAttributesW(path, 0)  # a hidden file cannot be opened for writing
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        if sys.platform == "win32":
+            import ctypes
+            ctypes.windll.kernel32.SetFileAttributesW(path, 2)  # hidden
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
+# ---- link check: can this model be downloaded right now? (asked when a link is added to the list)
+MODEL_LINK = re.compile(r"/models/(\d+)")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # a 3xx answer is reported as it is: we only want to know where the server sends us
+
+
+def probe_download(url, token):
+    """One-byte request to the file address (never reads the file). Returns (http code, note for the log).
+    The token goes into ?token= like in the real download. A redirect to file storage means 'allowed'."""
+    tok = AUTH.fresh(token)
+    full = url + ("&" if "?" in url else "?") + "token=" + urllib.parse.quote(tok) if tok else url
+    req = urllib.request.Request(full, headers={"User-Agent": UA, "Range": "bytes=0-0"})
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=20) as r:
+            return getattr(r, "status", 200), "content-type=%s" % (r.headers.get("Content-Type") or "?")
+    except urllib.error.HTTPError as e:
+        loc = (e.headers.get("Location") if e.headers else "") or ""
+        try:
+            body = e.read(200).decode("utf-8", "replace").replace("\n", " ")
+        except Exception:  # noqa
+            body = ""
+        note = "answer %s" % e.code
+        if loc:
+            note += ", sends to %s" % (urllib.parse.urlsplit(loc).netloc or loc[:40])
+        if body:
+            note += ", text: %r" % body[:120]
+        return e.code, note + ("|" + loc if loc else "")
+
+
+def _parse_utc(text):
+    try:
+        return datetime.datetime.strptime(str(text)[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+KEPT_LINKS = set()   # links the user chose to keep in the link-check window: the run only warns about them
+
+
+def access_state(ver, token, url=""):
+    """Is this model version paid or in early access - and does THIS account have the access anyway?
+    paidAccess does not say who bought it, so the file address is asked with a one-byte request (only for such versions).
+    Returns {"kind": ok | paid | early, "text", "probe"}."""
+    res = {"kind": "ok", "text": "", "probe": ""}
+    pa = ver.get("paidAccess")
+    if not pa:
+        return res
+    ends = _parse_utc(pa.get("endsAt")) if isinstance(pa, dict) else None
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if isinstance(pa, dict) and not pa.get("permanent") and ends and ends <= now:
+        return res  # early access is over
+    if isinstance(pa, dict) and not pa.get("permanent") and ends:
+        left = ends - now
+        res["kind"] = "early"
+        res["text"] = "Early access until %s UTC (in %d d %d h): it can be downloaded only after buying it, or when the period ends." % (
+            ends.strftime("%Y-%m-%d %H:%M"), left.days, left.seconds // 3600)
+    else:
+        res["kind"] = "paid"
+        res["text"] = "Paid model: the access has to be bought on Civitai."
+    dl = ver.get("downloadUrl") or ""
+    if dl:
+        try:
+            code, note = probe_download(dl, token)
+        except Exception as e:  # noqa
+            code, note = 0, "%s: %s" % (type(e).__name__, e)
+        loc = note.split("|", 1)[1] if "|" in note else ""
+        note = note.split("|", 1)[0]
+        res["probe"] = "test request to the file address: %s" % note
+        file_log("access check %s: %s" % (url or dl, res["probe"]))
+        # allowed = the file itself, or a redirect to file storage (an absolute address outside Civitai).
+        # A redirect to a Civitai page (/model-versions/ID, a login or purchase page) means "no access".
+        to_storage = code in (301, 302, 303, 307, 308) and loc.lower().startswith(("http://", "https://")) and not site_of(loc)
+        if code in (200, 206) or to_storage:
+            res.update(kind="ok", text="Paid, but this account has access (a test request to the file address was accepted).")
+        elif code not in (301, 302, 303, 307, 308, 401, 402, 403):
+            res["text"] += " (Not confirmed: the test request answered %s.)" % (code or "no answer")
+    return res
+
+
+def check_availability(url, apikey):
+    """Asks Civitai whether the model link can be downloaded now (one or two small requests; a test request to the file only
+    for paid / early-access versions). Returns {"kind", "text", "name", "ver", "probe"}; kind is one of:
+    skip (not a model link) / ok / paid / early / notfound / denied / unpublished / error (no answer - the check is silent)."""
+    out = {"kind": "skip", "text": "", "name": "", "ver": "", "probe": ""}
+    p = urllib.parse.urlparse(url)
+    mm = MODEL_LINK.search(p.path)
+    if not mm:
+        return out
+    host = p.netloc
+    token = AUTH.peek(url, apikey)
+    vid = urllib.parse.parse_qs(p.query).get("modelVersionId", [None])[0]
+    out["model_id"] = mm.group(1)
+
+    def get(u):
+        return json.loads(http_get(u, token, timeout=25, retries=2).decode("utf-8"))
+
+    try:
+        if not vid:
+            model = get("%s://%s/api/v1/models/%s" % (SCHEME, host, mm.group(1)))
+            versions = model.get("modelVersions") or []
+            if not versions:
+                out.update(kind="unpublished", text="The model has no published versions.")
+                return out
+            vid = versions[0]["id"]
+            out["name"] = model.get("name") or ""
+        ver = get("%s://%s/api/v1/model-versions/%s" % (SCHEME, host, vid))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            out.update(kind="notfound", text="Not found on %s: the model or version was deleted or is hidden." % host)
+        elif e.code in (401, 403):
+            out.update(kind="denied", text="Civitai refused access (HTTP %s): sign in, or the model is restricted." % e.code)
+        else:
+            out.update(kind="error", text="HTTP %s" % e.code)
+        return out
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError, KeyError, IndexError, TypeError) as e:
+        out.update(kind="error", text="%s: %s" % (type(e).__name__, e))
+        return out
+
+    out["name"] = out["name"] or (ver.get("model") or {}).get("name") or ""
+    out["ver"] = ver.get("name") or ""
+    out["vid"] = ver.get("id") or vid
+    vfiles = ver.get("files") or []
+    prim = next((f for f in vfiles if f.get("primary")), None) or next(
+        (f for f in vfiles if str(f.get("name", "")).lower().endswith(".safetensors")), None) or (vfiles[0] if vfiles else None)
+    out["primary"] = (prim or {}).get("name") or ""
+    status = ver.get("status")
+    if status and status != "Published":
+        out.update(kind="unpublished", text="This version is not published (status: %s)." % status)
+        return out
+    out["kind"] = "ok"
+    out.update(access_state(ver, token, url))
+    return out
+
+
+def check_link(url, apikey, extra=None):
+    """The whole check of one link: is it available (Civitai), and is it already downloaded / does its folder exist (disk).
+    extra = the current window settings (PATH, PREFIX, MODEL, EXISTING, RENAME_ID)."""
+    res = check_availability(url, apikey)
+    if res.get("kind") != "ok" or not extra or not res.get("name"):
+        return res
+    try:
+        folder_note = local_check(res, extra)
+    except OSError as e:
+        file_log("local check failed: %r" % (e,))
+        return res
+    res.update(folder_note or {})
+    return res
+
+
+def local_check(res, extra):
+    path = (extra.get("PATH") or "").strip()
+    if not path:
+        return None
+    folder = os.path.join(path, safe_name(res["name"]))
+    if not os.path.isdir(folder):
+        return None
+    items = [n for n in os.listdir(folder) if n != MARKER]
+    if not items:
+        return None
+    ids = folder_model_ids(folder)
+    mid = str(res.get("model_id") or "")
+    if ids and mid not in ids:
+        return {"kind": "folder", "text": "A folder with this name already exists, but it holds another model (id %s):\n%s" % (
+            ", ".join(sorted(ids)), folder)}
+    if flag(extra, "MODEL") and str(extra.get("EXISTING", "ask")).lower() != "overwrite" and res.get("primary"):
+        orig = safe_name(res["primary"], 200)
+        pre = extra.get("PREFIX", "")
+        names = {pre + orig}
+        if flag(extra, "RENAME_ID"):
+            for several in (False, True):
+                nice = readable_file_name(orig, res["name"], res.get("ver"), several)
+                if nice:
+                    names.add(pre + nice)
+        for n in names:
+            fp = os.path.join(folder, n)
+            if os.path.exists(fp) and os.path.getsize(fp) > 0:
+                rec = history_find("model:%s" % res.get("vid"))
+                when = (" on %s" % rec["time"][:16]) if rec else ""
+                return {"kind": "downloaded", "text": "This version is already downloaded%s:\n%s" % (when, fp)}
+    if not ids:
+        return {"kind": "folder", "text": "A folder with this name already exists and has files in it; it is not known which model it holds:\n%s" % folder}
+    return None
+
+
+class LinkChecker:
+    """Watches the link list: every model link that stays unchanged for a moment is checked in a background thread.
+    Links with a problem are handed out in batches for one dialog; START stays locked while anything is unsettled."""
+    STABLE = 0.6        # seconds a new line must stay unchanged (typing or pasting may still be going on)
+    BATCH_WAIT = 0.3    # seconds after the last problem when nothing else is being checked
+    BATCH_MAX = 6.0
+
+    def __init__(self, check_fn=None, log=None, notify=None):
+        self.check_fn = check_fn or check_link
+        self.log = log or (lambda m: None)
+        self.notify = notify or (lambda *a: None)
+        self.state = {}       # link -> queued / ok / problem / kept
+        self.kinds = {}       # link -> kind of the problem it was given
+        self.seen = {}        # link -> when it appeared
+        self.problems = []    # [(link, result)] waiting for the dialog
+        self.last_problem = 0.0
+        self.q_in, self.q_out = queue.Queue(), queue.Queue()
+        self.thread = None
+
+    def _worker(self):
+        while True:
+            u, apikey, extra = self.q_in.get()
+            try:
+                res = self.check_fn(u, apikey, extra)
+            except Exception as e:  # noqa
+                res = {"kind": "error", "text": "%s: %s" % (type(e).__name__, e), "name": "", "ver": "", "probe": ""}
+            self.q_out.put((u, res))
+            if not self.q_in.empty():
+                time.sleep(0.4)  # a gentle pace only when several links are waiting
+
+    def tick(self, links, apikey, extra_fn=None, now=None):
+        """Call often from the window thread. Returns a batch [(link, result)] to show in the dialog, or None."""
+        now = time.time() if now is None else now
+        live = set(links)
+        for d in (self.state, self.seen, self.kinds):
+            for u in [u for u in d if u not in live]:
+                del d[u]
+        self.problems = [(u, r) for (u, r) in self.problems if u in live]
+        for u in links:
+            if u in self.state:
+                continue
+            if not MODEL_LINK.search(u):
+                self.state[u] = "ok"  # image links need no check
+                continue
+            if now - self.seen.setdefault(u, now) < self.STABLE:
+                continue
+            self.state[u] = "queued"
+            if self.thread is None:
+                self.thread = threading.Thread(target=self._worker, daemon=True)
+                self.thread.start()
+            self.q_in.put((u, apikey, extra_fn() if extra_fn else None))
+        while True:
+            try:
+                u, res = self.q_out.get_nowait()
+            except queue.Empty:
+                break
+            if self.state.get(u) != "queued":
+                continue  # the link left the list meanwhile
+            kind = res.get("kind")
+            label = (res.get("name") or "model") + ((" (version: %s)" % res["ver"]) if res.get("ver") else "")
+            if kind == "error":
+                self.state[u] = "ok"
+                self.log("Link check: could not check %s - %s. The link stays in the list." % (label, res.get("text")))
+            elif kind in ("ok", "skip"):
+                self.state[u] = "ok"
+                self.log("Link check: %s - available%s" % (label, (" (" + res["text"] + ")") if res.get("text") else ""))
+            else:
+                self.state[u] = "problem"
+                self.kinds[u] = kind
+                self.log("Link check: %s - %s" % (label, res.get("text")))
+                self.problems.append((u, res))
+                self.last_problem = now
+                self.notify("attention", u, (res.get("text") or "")[:90] + " Waiting for your decision in the grabber.")
+            if res.get("probe"):
+                self.log("   " + res["probe"])
+        if self.problems:
+            busy = any(s == "queued" for s in self.state.values())
+            if (not busy and now - self.last_problem >= self.BATCH_WAIT) or now - self.last_problem >= self.BATCH_MAX:
+                rows, self.problems = self.problems, []
+                return rows
+        return None
+
+    def trust(self, links):
+        """Links that arrive complete (from the browser extension) need no waiting for the typing to finish."""
+        for u in links:
+            self.seen[u] = 0
+
+    def warned(self, links):
+        """Links in the list that carry a warning (waiting for the answer, or kept after it)."""
+        return sum(1 for u in links if self.state.get(u) in ("problem", "kept"))
+
+    def settle(self, removed, kept):
+        for u in kept:
+            self.state[u] = "kept"
+        for u in removed:
+            self.state.pop(u, None)
+            self.seen.pop(u, None)
+            self.kinds.pop(u, None)
+
+    def unsettled(self, links):
+        return sum(1 for u in links if MODEL_LINK.search(u) and self.state.get(u) in (None, "queued", "problem"))
+
+    def recheck_kept(self, links):
+        """START: a link the user chose to keep is asked about again (nothing is remembered about 'keep')."""
+        n = 0
+        for u in links:
+            if self.state.get(u) == "kept" and self.kinds.get(u) not in ("downloaded", "folder"):  # these answers stand
+                del self.state[u]
+                self.seen[u] = 0
+                n += 1
+        return n
 
 
 def sniff_ext(path, ctype=""):
@@ -1179,42 +1615,48 @@ def ensure_dir(path):
 
 
 def cleanup_after_run(log):
-    """At the end of a run: offer to delete incomplete (.part) files and the empty folders this run has created."""
+    """At the end of a run: folders this run created and left empty are removed without asking (nothing is lost);
+    incomplete (.part) files are offered for deletion - together with the folders that would be empty without them."""
+    emptied = 0
+    for d in sorted(set(STATE["made_dirs"]), key=len, reverse=True):  # the deepest first: a parent may become empty
+        try:
+            if not os.listdir(d):
+                os.rmdir(d)
+                emptied += 1
+        except OSError:
+            continue
+    if emptied:
+        log("Removed %d empty folder(s) created by this run." % emptied)
     parts = sorted(p for p in STATE["parts"] if os.path.exists(p))
     gone = set(parts)
     dirs = []
-    for d in sorted(set(STATE["made_dirs"]), key=len, reverse=True):  # the deepest first
+    for d in sorted(set(STATE["made_dirs"]), key=len, reverse=True):
         try:
             items = os.listdir(d)
         except OSError:
             continue
-        if all(os.path.join(d, x) in gone for x in items):
+        if items and all(os.path.join(d, x) in gone for x in items):
             dirs.append(d)
             gone.add(d)
-    if not parts and not dirs:
+    if not parts:
         return
+
     def short(path):
         return "\\".join(path.replace("/", "\\").split("\\")[-3:])
-    lines = ["The run left some leftovers:", ""]
-    if parts:
-        lines.append("Incomplete files (%d):" % len(parts))
-        for pth in parts[:6]:
-            lines.append("   %s  (%.1f MB)" % (short(pth), os.path.getsize(pth) / 1048576))
-        if len(parts) > 6:
-            lines.append("   ... and %d more" % (len(parts) - 6))
+    lines = ["The run left incomplete files:", ""]
+    for pth in parts[:6]:
+        lines.append("   %s  (%.1f MB)" % (short(pth), os.path.getsize(pth) / 1048576))
+    if len(parts) > 6:
+        lines.append("   ... and %d more" % (len(parts) - 6))
     if dirs:
-        lines.append("Empty folders (%d), created by this run:" % len(dirs))
-        for d in dirs[:6]:
-            lines.append("   %s" % short(d))
-        if len(dirs) > 6:
-            lines.append("   ... and %d more" % (len(dirs) - 6))
+        lines += ["", "%d folder(s) created by this run would stay empty without them." % len(dirs)]
     lines += ["", "Delete them?", "(An incomplete file can be resumed by downloading the same link again.)"]
     fn = ASK_CLEANUP["fn"]
     if not fn:
-        log("Leftovers: %d incomplete file(s), %d empty folder(s) - not removed" % (len(parts), len(dirs)))
+        log("Leftovers: %d incomplete file(s) - not removed" % len(parts))
         return
     if not fn("\n".join(lines)):
-        log("Leftovers kept: %d incomplete file(s), %d empty folder(s)" % (len(parts), len(dirs)))
+        log("Leftovers kept: %d incomplete file(s)" % len(parts))
         return
     for pth in parts:
         try:
@@ -1920,6 +2362,24 @@ def scrape_image_page(host, image_id, token, debug_dir=None):
 
 # ------------------------------------------------------------- main scenarios
 
+ID_NAME_RE = re.compile(r"^(?:.*[-_ ])?(?P<ulid>[0-9A-Z]{26})(?:\.[A-Za-z0-9]{6,10})?$")
+
+
+def readable_file_name(orig, model_name, version_name, several_versions):
+    """A model file whose name is only an ID (26 random characters, optionally with a short suffix) gets the model title.
+    Returns the new file name, or None when the name is not ID-like."""
+    stem, ext = os.path.splitext(orig)
+    m = ID_NAME_RE.match(stem)
+    if not m or not re.search(r"\d", m.group("ulid")) or not re.search(r"[A-Z]", m.group("ulid")):
+        return None
+    base = safe_name(model_name or "", 150)
+    if base == "unnamed":
+        return None
+    if several_versions and version_name:
+        base = safe_name("%s - %s" % (base, version_name), 190)
+    return base + ext
+
+
 def flag(cfg, key):
     return str(cfg.get(key, DEFAULTS.get(key, ""))).strip().lower() in ("1", "true", "yes", "y")
 
@@ -2143,9 +2603,19 @@ def process_model(url, cfg, log, stop, ask, next_is_image=False):
             log("  This version has %d model files; downloading the main one (%s)" % (len(weights), (primary or {}).get("name", "")))
     jobs = []
     for f in picked:
-        fn = cfg.get("PREFIX", "") + safe_name(f.get("name") or ("%s.safetensors" % vid), 200)
-        jobs.append({"name": fn, "dest": os.path.join(folder, fn), "url": f.get("downloadUrl") or ver.get("downloadUrl"),
-                     "info": describe_file(f)})
+        orig = safe_name(f.get("name") or ("%s.safetensors" % vid), 200)
+        fn = cfg.get("PREFIX", "") + orig
+        job = {"name": fn, "url": f.get("downloadUrl") or ver.get("downloadUrl"), "info": describe_file(f)}
+        if flag(cfg, "RENAME_ID"):
+            nice = readable_file_name(orig, model.get("name") or name, ver.get("name"), len(model.get("modelVersions") or []) > 1)
+            if nice:
+                job["orig"], job["orig_dest"] = orig, os.path.join(folder, fn)  # the old name: files downloaded earlier still count
+                job["name"] = fn = cfg.get("PREFIX", "") + nice
+        job["dest"] = os.path.join(folder, fn)
+        jobs.append(job)
+    orig_note = ", ".join(j["orig"] for j in jobs if j.get("orig"))
+    if orig_note and do_model:
+        log("  The file name is only an ID (%s) - saved as: %s" % (orig_note, ", ".join(j["name"] for j in jobs)))
     if do_model and jobs:
         many = len(weights) >= 2
         fname_shown = ", ".join(("%s (%s, %s)" % (j["name"], j["info"]["info"], j["info"]["size"])) if many else j["name"] for j in jobs)
@@ -2153,7 +2623,23 @@ def process_model(url, cfg, log, stop, ask, next_is_image=False):
         fname_shown = "(not downloaded)"
 
     overwrite = False
-    have_any = do_model and any(os.path.exists(j["dest"]) and os.path.getsize(j["dest"]) > 0 for j in jobs)
+    have_any = do_model and any(os.path.exists(pth) and os.path.getsize(pth) > 0
+                                for j in jobs for pth in (j["dest"], j.get("orig_dest")) if pth)
+    if do_model and jobs and not have_any and ver.get("paidAccess"):
+        acc = access_state(ver, token, url)  # last line of defence: nothing is created for a model that cannot be downloaded
+        if acc["kind"] in ("paid", "early"):
+            log("  " + acc["text"])
+            if acc.get("probe"):
+                log("  " + acc["probe"])
+            if url in KEPT_LINKS:  # the user was already told (twice) and chose to keep the link in the list
+                if "Not confirmed" in acc["text"]:
+                    log("  The access could not be confirmed - trying to download anyway")
+                else:
+                    log("  SKIPPED: this version cannot be downloaded now. The link stays in the list; no folder was created.")
+                    return "kept"
+            elif not ask("%s\n\n%s\n\nTry to download anyway?\n(No: nothing is created, the link stays in the list.)" % (name, acc["text"])):
+                log("  SKIPPED: this version cannot be downloaded now. The link stays in the list; no folder was created.")
+                return "kept"
     if have_any:
         rec = history_find("model:%s" % vid)
         when = (" (downloaded %s)" % rec["time"]) if rec else ""
@@ -2209,7 +2695,7 @@ def process_model(url, cfg, log, stop, ask, next_is_image=False):
     if md:
         out = ["# %s" % name, "", "- **Version:** %s" % ver.get("name", ""),
                "- **Type:** %s | **Base model:** %s" % (model.get("type", ""), ver.get("baseModel", "")),
-               "- **Page:** %s" % url, "- **File:** %s" % fname_shown]
+               "- **Page:** %s" % url, "- **Model ID:** %s | **Version ID:** %s" % (model_id, vid), "- **File:** %s" % fname_shown] + (["- **Original file name:** %s" % orig_note] if orig_note else [])
         if tw:
             out.append("- **Trigger words:** %s" % ", ".join(tw))
         if tags_txt:
@@ -2220,7 +2706,7 @@ def process_model(url, cfg, log, stop, ask, next_is_image=False):
     else:
         out = ["MODEL: %s" % name, "Version: %s" % ver.get("name", ""),
                "Type: %s | Base model: %s" % (model.get("type", ""), ver.get("baseModel", "")),
-               "Page: %s" % url, "File: %s" % fname_shown]
+               "Page: %s" % url, "Model ID: %s | Version ID: %s" % (model_id, vid), "File: %s" % fname_shown] + (["Original file name: %s" % orig_note] if orig_note else [])
         if tw:
             out.append("Trigger words: %s" % ", ".join(tw))
         if tags_txt:
@@ -2231,6 +2717,11 @@ def process_model(url, cfg, log, stop, ask, next_is_image=False):
     for n, meta in entries:
         out += ["", meta_block("Example", n, meta, False, md)]
     if dname:
+        other = dscr_owner(os.path.join(folder, dname))
+        if other and other != str(model_id):  # the description of ANOTHER model lies here: never overwrite it
+            base_, ext_ = os.path.splitext(dname)
+            dname = "%s (%s)%s" % (base_, model_id, ext_)
+            log("  The description file of another model (id %s) is in this folder - writing %s instead" % (other, dname))
         dpath = os.path.join(folder, dname)
         keep = ""
         try:  # keep blocks of single images that were appended to the old description file earlier
@@ -2248,6 +2739,7 @@ def process_model(url, cfg, log, stop, ask, next_is_image=False):
         log("  Description file skipped (its name is empty)")
     if not do_model:
         log("  [NO MODEL FILE] this model was processed without its model file (the Model file option was off)")
+    write_marker(folder, model_id, vid, name, url)
     history_add("model:%s" % vid, url, folder, "ok",
                 note=None if do_model else "examples only - model file NOT downloaded (Model file option was off)")
     gal_raw = str(cfg.get("GALLERY", "0")).strip().lower()
@@ -2431,10 +2923,19 @@ WHERE THINGS GO
 
 OPTIONS
 Model file: tick to download the model file; the prefix box is used only then. Examples: how many example images/videos of the model version to download (number, all, or 0/empty for none; videos count). From gallery: how many images that other users uploaded to the model's gallery to download (number or all; needs the browser bridge, so the box is greyed out without it). 
-If already downloaded: ask, skip, or download again (images already saved to a different folder are never treated as downloaded).
+If a model or image was downloaded before, the program asks (the box that chose between ask / skip / download again is hidden for now; a task file can still set EXISTING). Images already saved to a different folder are never treated as downloaded.
 Add prefix: text put before the model file name. Description file: name of the description file (.txt or .md, no extension = .txt; empty = no description file is written). "Name as model" names that file after the model instead (the extension still comes from the box).
 Original file names: try to read the original name from the image page. WebP to JPG needs the Pillow library (py -m pip install pillow).
 ComfyUI workflow as .json: experimental, saves the workflow found in the metadata next to the image.
+
+LINK CHECK
+A moment after a model link appears in the list (pasted, typed, or sent by the browser extension) the program asks Civitai whether it can be downloaded now. A paid model, a model in early access (with its end date), a deleted or hidden model, or an unpublished version is reported in a window: you remove the link from the list or keep it. START stays locked until all checks are done and answered. Links that are already downloaded, or whose model folder already exists with another (or an unknown) model in it, are reported in the same way (for an existing folder the buttons are "Exclude link" / "Download anyway"). A kept availability problem is checked again when you press START. If Civitai cannot be reached, the link simply stays in the list. Paid and early-access links get one extra one-byte test request to the file address (it shows whether your account already bought the access); free models get no test request.
+
+PREFIX LINK
+The chain button after the prefix links the prefix typed now to the current output folder. Every folder has its own link; folders without a link keep working as before. When a linked folder is chosen (Browse, the drop-down list, typing), its prefix is filled in. Joined rings: linked (click to unlink); rings apart: not linked, or the prefix was changed after linking (click to link the prefix typed now). The prefix can always be edited.
+
+NAME ID-LIKE MODEL FILES BY TITLE
+With this box ticked, a model file that has only an ID for a name (26 random characters, as the Civitai trainer makes them) is saved as <prefix><model title>.safetensors; when the model has several versions the version name is added. The original name is written to the description file. A model downloaded earlier under its ID name still counts as already downloaded.
 
 TASK FILES
 The buttons "Create sample txt" and "Load from txt" are hidden for now (set SHOW_TXT_BUTTONS = True at the top of the script to bring them back); a task file can also be given on the command line. A task file holds TOKEN, PATH, PREFIX, PICS ... and the links. Empty keys are ignored, so a file can contain only links. If a value in the file differs from the window, you are asked which one to use.
@@ -2662,7 +3163,7 @@ class Tooltip:
 EXISTING_LABELS = [("Ask", "ask"), ("Skip", "skip"), ("Download again", "overwrite")]
 
 
-FLAG_KEYS = ("VIDEO", "ORIGINAL", "COMFY", "WEBP2JPG", "USE_SUBFOLDER", "BRIDGE", "DSCR_AS_MODEL", "MODEL")
+FLAG_KEYS = ("VIDEO", "ORIGINAL", "COMFY", "WEBP2JPG", "USE_SUBFOLDER", "BRIDGE", "DSCR_AS_MODEL", "MODEL", "RENAME_ID")
 TEXT_KEYS = ("TOKEN", "PATH", "PREFIX", "PICS", "IMGFOLDER", "DSCR", "GALLERY")
 
 
@@ -2786,7 +3287,7 @@ def main_gui():
 
     v = {k: tk.StringVar() for k in TEXT_KEYS}
     b = {k: tk.BooleanVar() for k in FLAG_KEYS}
-    existing_var = tk.StringVar()
+    existing_var = tk.StringVar(value="Ask")
 
     # ---- settings
     frm = ttk.Frame(root, padding=(8, 8, 8, 4))
@@ -2796,7 +3297,7 @@ def main_gui():
     ttk.Label(frm, text="API token:").grid(row=0, column=0, sticky="w", pady=2)
     row_tk = ttk.Frame(frm)
     row_tk.grid(row=0, column=1, columnspan=2, sticky="we", padx=(6, 0), pady=2)
-    e_token = ttk.Entry(row_tk, textvariable=v["TOKEN"], show="•", width=44)
+    e_token = ttk.Entry(row_tk, textvariable=v["TOKEN"], show="•", width=32)
     e_token.pack(side="left", ipady=2)
     lock_btn = ttk.Button(row_tk, text="Lock", width=9)
     lock_btn.pack(side="left", padx=(6, 0))
@@ -2808,23 +3309,56 @@ def main_gui():
     bridge_lbl.pack(side="right", padx=(0, 6))
 
     ttk.Label(frm, text="Output folder:").grid(row=1, column=0, sticky="w", pady=2)
-    path_combo = ttk.Combobox(frm, textvariable=v["PATH"], height=12)
-    path_combo.grid(row=1, column=1, sticky="nswe", padx=(6, 0), pady=2, ipady=2)
+    row_path = ttk.Frame(frm)
+    row_path.grid(row=1, column=1, columnspan=2, sticky="we", padx=(6, 0), pady=2)
+    path_combo = ttk.Combobox(row_path, textvariable=v["PATH"], height=13)  # 12 recent folders + "Add output folder..." without a scroll bar
+    path_combo.pack(side="left", fill="x", expand=True, ipady=2)
     combos["PATH"] = path_combo
-    browse_btn = ttk.Button(frm, text="Browse…", width=9)
-    browse_btn.grid(row=1, column=2, sticky="nswe", padx=(6, 0), pady=2)
-
-    # row 3: what to download (left) and the single-image subfolder (right)
-    row_dl = ttk.Frame(frm)
-    row_dl.grid(row=2, column=0, columnspan=3, sticky="we", pady=2)
-    cb_model = ttk.Checkbutton(row_dl, text="Model file", variable=b["MODEL"])
-    cb_model.pack(side="left")
-    lbl_prefix = ttk.Label(row_dl, text="Add prefix:")
-    lbl_prefix.pack(side="left", padx=(12, 6))
-    e_prefix = ttk.Combobox(row_dl, textvariable=v["PREFIX"], width=12, height=12)
-    e_prefix.pack(side="left", ipady=2)
+    try:
+        scale = min(3.0, max(1.0, root.winfo_fpixels("1i") / 96.0))
+    except tk.TclError:
+        scale = 1.0
+    icon_on = tk.PhotoImage(data=base64.b64encode(chain_icon_png(True, scale / 1.5)))
+    icon_off = tk.PhotoImage(data=base64.b64encode(chain_icon_png(False, scale / 1.5)))
+    link_btn = ttk.Label(row_path, image=icon_off, cursor="hand2")  # no button outline: just the chain
+    link_btn.pack(side="left", padx=(8, 4))
+    lbl_prefix = ttk.Label(row_path, text="Prefix:")
+    lbl_prefix.pack(side="left", padx=(4, 6))
+    prefix_box = ttk.Frame(row_path, width=110, height=26)  # its width is set so that the field starts under the "Browser bridge" box
+    prefix_box.pack(side="left")
+    prefix_box.pack_propagate(False)
+    e_prefix = ttk.Combobox(prefix_box, textvariable=v["PREFIX"], height=12)
+    e_prefix.pack(fill="both", expand=True, ipady=2)
     combos["PREFIX"] = e_prefix
-    ttk.Label(row_dl, text="Examples:").pack(side="left", padx=(12, 6))
+
+    def align_prefix():
+        """The left edge of the prefix field = the left edge of the "Browser bridge" check square in the row above."""
+        root.update_idletasks()
+        left = cb_bridge.winfo_rootx() + CHECK_INDENT
+        w = row_path.winfo_rootx() + row_path.winfo_width() - left
+        if w > 60:
+            prefix_box.configure(width=w, height=e_prefix.winfo_reqheight() + 4)
+
+    align_state = {"after": None}
+
+    def align_later(_e=None):
+        if align_state["after"]:
+            root.after_cancel(align_state["after"])
+        align_state["after"] = root.after(60, lambda: (align_state.update(after=None), align_prefix()))
+
+    frm.bind("<Configure>", align_later)
+    root.after(150, align_later)
+
+    # row 3: description file (its label sits in the label column, so its field starts exactly under the fields above),
+    # then the image parameters in their natural order: examples, gallery, subfolder
+    ttk.Label(frm, text="Description file:").grid(row=2, column=0, sticky="w", pady=2)
+    row_dl = ttk.Frame(frm)
+    row_dl.grid(row=2, column=1, columnspan=2, sticky="we", padx=(6, 0), pady=2)
+    e_dscr = ttk.Entry(row_dl, textvariable=v["DSCR"], width=14)
+    e_dscr.pack(side="left", ipady=2)
+    cb_dname = ttk.Checkbutton(row_dl, text="Name as model", variable=b["DSCR_AS_MODEL"])
+    cb_dname.pack(side="left", padx=(8, 0))
+    ttk.Label(row_dl, text="Examples:").pack(side="left", padx=(16, 6))
     e_pics = ttk.Entry(row_dl, textvariable=v["PICS"], width=6)
     e_pics.pack(side="left", ipady=2)
     ttk.Label(row_dl, text="From gallery:").pack(side="left", padx=(12, 6))
@@ -2835,22 +3369,6 @@ def main_gui():
     e_img = ttk.Combobox(row_dl, textvariable=v["IMGFOLDER"], width=12)
     e_img.pack(side="left", fill="x", expand=True, ipady=2)  # grows with the window
     combos["IMGFOLDER"] = e_img
-
-    # row 4: what to do with known items (left), description file (right)
-    row_ex = ttk.Frame(frm)
-    row_ex.grid(row=3, column=0, columnspan=3, sticky="we", pady=2)
-    # everything sits at the right edge; free space stays on the left
-    cb_dname = ttk.Checkbutton(row_ex, text="Name as model", variable=b["DSCR_AS_MODEL"])
-    cb_dname.pack(side="right", padx=(10, 0))
-    dscr_box = ttk.Frame(row_ex)  # its width is set by align_rows() so that this row lines up with the check boxes above
-    dscr_box.pack(side="right")
-    e_dscr = ttk.Entry(dscr_box, textvariable=v["DSCR"], width=14)
-    e_dscr.pack(fill="both", expand=True, ipady=2)
-    ttk.Label(row_ex, text="Description file:").pack(side="right", padx=(16, 6))
-    combo = ttk.Combobox(row_ex, textvariable=existing_var, state="readonly", width=14,
-                         values=[lbl for lbl, _ in EXISTING_LABELS])
-    combo.pack(side="right")
-    ttk.Label(row_ex, text="If already downloaded:").pack(side="right", padx=(0, 6))
 
     def sync_fields(*_):  # greyed-out boxes: subfolder unless its box is ticked, prefix without Model file, name box with Name-as-model
         e_img.configure(state="normal" if b["USE_SUBFOLDER"].get() else "disabled")
@@ -2872,12 +3390,13 @@ def main_gui():
     hdr = ttk.Frame(top_pane)  # "Links" title on the left, option checkboxes on the right
     hdr.pack(fill="x")
     ttk.Label(hdr, text="Links (one per line):").pack(side="left")
-    cb_comfy = ttk.Checkbutton(hdr, text="ComfyUI workflow as .json", variable=b["COMFY"])
+    cb_model = ttk.Checkbutton(hdr, text="Model file", variable=b["MODEL"])
     cb_webp = ttk.Checkbutton(hdr, text="Convert WebP to JPG", variable=b["WEBP2JPG"])
     cb_orig = ttk.Checkbutton(hdr, text="Original file names", variable=b["ORIGINAL"])
     cb_video = ttk.Checkbutton(hdr, text="Include videos", variable=b["VIDEO"])
-    cb_comfy.pack(side="right")
-    for w in (cb_webp, cb_orig, cb_video):
+    cb_rename = ttk.Checkbutton(hdr, text="Name ID-like model files by title", variable=b["RENAME_ID"])
+    cb_rename.pack(side="right")  # where "ComfyUI workflow as .json" (COMFY, hidden for now) used to be
+    for w in (cb_webp, cb_orig, cb_video, cb_model):  # from the right: Model file, videos, original names, WebP, ID rename
         w.pack(side="right", padx=(0, 14))
     actions = ttk.Frame(top_pane, padding=(0, 10, 0, 6))
     actions.pack(side="bottom", fill="x")
@@ -2956,10 +3475,10 @@ def main_gui():
                          "API token is not used (the log says which credentials every run used). Needs a free local port 8765."),
             (path_combo, "Category folder: the place for one kind of models (characters, styles, poses ...). "
                          "Every model gets its own subfolder here, named after the model. "
-                         "The drop-down list holds the 12 most recently used folders."),
-            (browse_btn, "Choose the category folder."),
+                         "The drop-down list holds the 12 most recently used folders; its first line, \"Add output folder...\", "
+                         "opens the folder chooser."),
             (cb_model, "Download the model file (LoRA, checkpoint ...). Untick to get only examples/gallery images and the description file."),
-            (lbl_prefix, "Text put in front of the model file name (used only when Model file is ticked). "
+            (lbl_prefix, "Prefix: text put in front of the model file name (used only when Model file is ticked). "
                          "Handy for sorting models in a stack."),
             (e_gal, "How many images other users uploaded to the model's gallery to download: a number, all (can be thousands!), "
                     "or 0/empty for none. Needs the browser bridge, so this box is greyed out without it."),
@@ -2974,13 +3493,15 @@ def main_gui():
             (e_dscr, "Name of the description file written next to the model (.txt or .md; no extension = .txt). "
                      "Markdown is used for .md. EMPTY = no description file is written."),
             (e_pics, "How many example images/videos the model's author attached to the version: a number, all, or 0/empty for none."),
-            (combo, "What to do when a model or single image was downloaded before: ask each time, skip, or download again."),
             (cb_video, "Also download video examples. They count towards the number of examples."),
+            (link_btn, "Link the prefix to the output folder. Rings joined: linked - the prefix is filled in whenever this folder is chosen; "
+                       "click to unlink. Rings apart: not linked, or the prefix was changed - click to link the prefix typed now to this folder. "
+                       "Editing the prefix is never blocked."),
+            (cb_rename, "A model file whose name is only an ID (26 random characters, e.g. from the Civitai trainer) is saved under the model "
+                        "title (with the version name when the model has several versions). The original name is written to the description file."),
             (cb_orig, "Try to read the original file name from the image page. Pages are often blocked for scripts "
                       "(HTTP 403); then the name from the image address is used."),
             (cb_webp, "Convert downloaded WebP images to JPG (quality 95). Needs Pillow: py -m pip install pillow"),
-            (cb_comfy, "EXPERIMENTAL. If the metadata contains a ComfyUI workflow, save it as a .json file next to the "
-                       "image (same name), loadable in ComfyUI."),
             (urlbox, "Model links (…/models/ID) and single image links (…/images/ID), one per line. "
                      "Finished links disappear from the list; failed ones stay."),
             (undo_btn, "Undo the last change in the box you were working in (the link list by default). Ctrl+Z does the same."),
@@ -2996,6 +3517,62 @@ def main_gui():
             (cb_bridge, "Local port 127.0.0.1 for the browser extension, which fetches image pages with your logged-in browser."),
             (help_btn, "Short help.")):
         Tooltip(widget, text)
+
+
+    # ---- prefix linked to an output folder (every folder has its own link; the prefix stays editable)
+    prefix_map = {}
+    link_ctx = {"path_at": 0.0, "prefix_at": 0.0, "after": None}
+
+    def norm_path(p):  # the same folder written with / or \\, with or without a trailing slash, in any letter case
+        p = re.sub(r"/+", "/", (p or "").strip().replace("\\", "/")).rstrip("/")
+        return p.lower()
+
+    def link_state():
+        key = norm_path(v["PATH"].get())
+        if not key:
+            return "off"
+        if key not in prefix_map:
+            return "free"
+        return "linked" if prefix_map[key] == v["PREFIX"].get() else "changed"
+
+    def refresh_link(*_):  # only the picture changes: joined rings = linked; apart (paler) = not linked or the prefix was changed
+        st = link_state()
+        link_btn.state(["disabled"] if st == "off" else ["!disabled"])
+        link_btn.configure(image=icon_on if st == "linked" else icon_off, cursor="arrow" if st == "off" else "hand2")
+
+    def toggle_link():
+        key = norm_path(v["PATH"].get())
+        if not key:
+            return
+        if link_state() == "linked":
+            del prefix_map[key]
+            log("The prefix is no longer linked to this folder.")
+        else:
+            prefix_map[key] = v["PREFIX"].get()
+            log("The prefix \"%s\" is linked to this folder: it is filled in whenever the folder is chosen." % prefix_map[key])
+        refresh_link()
+        save_settings()
+
+    def apply_link():
+        link_ctx["after"] = None
+        key = norm_path(v["PATH"].get())
+        # a prefix set AFTER the folder (a task file, the user) wins over the link
+        if key in prefix_map and link_ctx["prefix_at"] <= link_ctx["path_at"] and v["PREFIX"].get() != prefix_map[key]:
+            v["PREFIX"].set(prefix_map[key])
+        refresh_link()
+
+    def on_path_change(*_):
+        link_ctx["path_at"] = time.time()
+        if link_ctx["after"]:
+            root.after_cancel(link_ctx["after"])
+        link_ctx["after"] = root.after(300, apply_link)  # not while the path is still being typed
+        refresh_link()
+
+    def on_prefix_change(*_):
+        link_ctx["prefix_at"] = time.time()
+        refresh_link()
+
+    link_btn.bind("<Button-1>", lambda _e: toggle_link() if link_state() != "off" else None)
 
     # ---- logic
     def set_lock(lock):
@@ -3051,8 +3628,8 @@ def main_gui():
                 auth_q.put(lambda: (refresh_signin_ui(), log("Sign-in failed: %s" % err),
                                     messagebox.showerror("Civitai Grabber", "Sign-in failed:\n%s" % err)))
             else:
-                auth_q.put(lambda: (refresh_signin_ui(), log("Signed in as %s on %s. From now on the sign-in is used "
-                                                            "instead of the API token." % (user or "?", site))))
+                auth_q.put(lambda: (refresh_signin_ui(), log("Signed in on %s. From now on the sign-in is used "
+                                                            "instead of the API token." % site)))
         threading.Thread(target=work, daemon=True).start()
 
     def push_recent(key, value):
@@ -3063,7 +3640,7 @@ def main_gui():
         lst[:] = [x for x in lst if os.path.normcase(x) != os.path.normcase(value)]
         lst.insert(0, value)
         del lst[RECENT_LIMIT.get(key, 10):]
-        combos[key].configure(values=lst)
+        combos[key].configure(values=([BROWSE_LABEL] + lst) if key == "PATH" else lst)
 
     def set_values(d):
         """Apply a (partial) settings dict to the window."""
@@ -3093,10 +3670,30 @@ def main_gui():
         file_log(msg)
         q.put(msg)
 
+    # ---- link check (a model link is checked a moment after it appears in the list, whatever way it got there)
+    checker = LinkChecker(log=log, notify=BRIDGE.notify)
+    start_ctx = {"pending": False, "force": False, "lock_since": None, "lock_told": False}
+
+    BROWSE_LABEL = "Add output folder\u2026"
+    path_prev = {"v": v["PATH"].get()}
+
     def browse_dir():
-        d = filedialog.askdirectory(title="Output folder")
+        cur = path_prev["v"]
+        d = filedialog.askdirectory(title="Output folder", initialdir=cur if cur and os.path.isdir(cur) else None)
         if d:
             v["PATH"].set(os.path.normpath(d))
+
+    def on_path_picked(_e=None):
+        if v["PATH"].get() == BROWSE_LABEL:  # the first line of the list is not a folder: put the old value back and ask
+            v["PATH"].set(path_prev["v"])
+            browse_dir()
+
+    def remember_path(*_):
+        if v["PATH"].get() != BROWSE_LABEL:
+            path_prev["v"] = v["PATH"].get()
+
+    v["PATH"].trace_add("write", remember_path)
+    path_combo.bind("<<ComboboxSelected>>", on_path_picked, "+")
 
     def create_sample():
         p = filedialog.asksaveasfilename(title="Save sample task file", initialfile="civitai_task.txt",
@@ -3192,20 +3789,6 @@ def main_gui():
 
     root.bind_all("<FocusIn>", remember_focus, "+")
 
-    def align_rows():
-        """The left edge of the "If already downloaded" box lines up with the "Original file names" check box above it
-        (the Description file box takes up the difference)."""
-        try:
-            root.update_idletasks()
-            w0, h0 = e_dscr.winfo_reqwidth(), e_dscr.winfo_reqheight() + 4  # + the ipady of the entry
-            dscr_box.pack_propagate(False)
-            dscr_box.configure(width=w0, height=h0)
-            root.update_idletasks()
-            delta = combo.winfo_rootx() - (cb_orig.winfo_rootx() + CHECK_INDENT)
-            dscr_box.configure(width=max(70, w0 + delta))
-        except Exception:  # noqa
-            pass
-
     def balance_actions():
         """Same space above the button row (to the link list) and below it (to the log), the divider included."""
         try:
@@ -3242,6 +3825,7 @@ def main_gui():
                 urlbox.insert("end", "\n")
             urlbox.insert("end", "\n".join(new) + "\n")
             urlbox.see("end")
+            checker.trust(new)
         log("Added %d link(s) from the browser%s" % (len(new), (" (%d already in the list)" % (len(links) - len(new))) if len(links) > len(new) else ""))
 
     def clear_urls():
@@ -3338,6 +3922,8 @@ def main_gui():
             icon, mode, frac = "error", "error", 1.0
         elif tb["hold"] == "done":
             icon, mode, frac = "done", "normal", 1.0
+        elif waiting and checker.warned(current_links()):  # a link with a warning is in the list: yellow, not the peaceful green
+            icon, mode, frac = "idle", "paused", 1.0
         elif waiting and TASKBAR_WAITING == "green":
             icon, mode, frac = "idle", "normal", 1.0
         elif waiting and TASKBAR_WAITING in ("yellow", "bar"):
@@ -3496,6 +4082,107 @@ def main_gui():
             return "could not start (ports busy)"
         return "connected" if BRIDGE.connected() else "waiting for the extension"
 
+    def ask_remove_links(rows, labels=("Remove link", "Keep link")):
+        """Modal window about links that cannot be downloaded now; rows = [(link, title, reason)].
+        Returns the links to remove from the list. Closing the window keeps everything (Enter does nothing on purpose:
+        the window may open while you are typing somewhere else)."""
+        win = tk.Toplevel(root)
+        win.title("Civitai Grabber - link check")
+        win.transient(root)
+        try:
+            if app_icon:
+                win.iconphoto(False, app_icon)
+        except tk.TclError:
+            pass
+        result = {"gone": []}
+        ticks = []
+        bold = tkfont.nametofont("TkDefaultFont").copy()
+        bold.configure(weight="bold")
+        if len(rows) == 1:
+            u, title, reason = rows[0]
+            ttk.Label(win, text=title, font=bold, wraplength=560, justify="left").pack(anchor="w", padx=14, pady=(12, 2))
+            ttk.Label(win, text=reason, wraplength=560, justify="left").pack(anchor="w", padx=14, pady=(0, 6))
+            ttk.Label(win, text=u, wraplength=560, justify="left", foreground="#555").pack(anchor="w", padx=14)
+            yes_text, no_text = labels
+        else:
+            ttk.Label(win, text="%d links cannot be downloaded now. Ticked links will be removed from the list:" % len(rows),
+                      wraplength=600, justify="left").pack(anchor="w", padx=14, pady=(12, 6))
+            holder = ttk.Frame(win)
+            holder.pack(fill="both", expand=True, padx=14)
+            canvas = tk.Canvas(holder, height=min(360, 74 * len(rows)), width=620, highlightthickness=0)
+            sb = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+            inner = ttk.Frame(canvas)
+            inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+            canvas.create_window((0, 0), window=inner, anchor="nw")
+            canvas.configure(yscrollcommand=sb.set)
+            canvas.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+            canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+            for u, title, reason in rows:
+                var = tk.BooleanVar(value=True)
+                ticks.append((u, var))
+                ttk.Checkbutton(inner, text=title, variable=var).pack(anchor="w", pady=(6, 0))
+                ttk.Label(inner, text=reason, wraplength=560, justify="left").pack(anchor="w", padx=(24, 0))
+                ttk.Label(inner, text=u, wraplength=560, justify="left", foreground="#555").pack(anchor="w", padx=(24, 0))
+            yes_text, no_text = "Remove ticked", "Keep all"
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=14, pady=12)
+
+        def yes():
+            result["gone"] = [rows[0][0]] if len(rows) == 1 else [u for u, var in ticks if var.get()]
+            win.destroy()
+
+        def no():
+            win.destroy()
+
+        ttk.Button(bar, text=no_text, command=no).pack(side="right")
+        ttk.Button(bar, text=yes_text, command=yes).pack(side="right", padx=(0, 8))
+        win.protocol("WM_DELETE_WINDOW", no)
+        win.bind("<Escape>", lambda _e: no())
+        win.update_idletasks()
+        x = root.winfo_rootx() + max(0, (root.winfo_width() - win.winfo_width()) // 2)
+        y = root.winfo_rooty() + max(0, (root.winfo_height() - win.winfo_height()) // 3)
+        win.geometry("+%d+%d" % (x, y))
+        win.grab_set()
+        win.focus_set()
+        root.wait_window(win)
+        return result["gone"]
+
+    def images_below(u, links):
+        """Image links that follow a model link in the list (they are saved into that model's folder)."""
+        if u not in links:
+            return []
+        out = []
+        for nxt in links[links.index(u) + 1:]:
+            if MODEL_LINK.search(nxt):
+                break
+            if re.search(r"/images/\d+", nxt):
+                out.append(nxt)
+        return out
+
+    def handle_problems(rows):
+        tb_flash(2)
+        items = []
+        for u, res in rows:
+            title = (res.get("name") or "Model") + ((" - " + res["ver"]) if res.get("ver") else "")
+            items.append((u, title, res.get("text") or "This link cannot be downloaded."))
+        kind = rows[0][1].get("kind") if len(rows) == 1 else ""
+        gone = list(ask_remove_links(items, ("Exclude link", "Download anyway") if kind == "folder" else ("Remove link", "Keep link")))
+        links = current_links()
+        for u in list(gone):
+            below = [x for x in images_below(u, links) if x not in gone]
+            if below and messagebox.askyesno(
+                    "Civitai Grabber",
+                    "%d image link(s) follow the removed model link in the list and belong to it.\n\nRemove them too?\n"
+                    "(If you keep them, they will be saved into the folder of the model above them, or into the output folder.)" % len(below)):
+                gone.extend(below)
+        for u in gone:
+            remove_line(u)
+            BRIDGE.notify("dismiss", u)  # the browser extension (0.17+) takes the link off its "Needs attention" list
+        kept = [u for u, _ in rows if u not in gone]
+        checker.settle(gone, kept)
+        log("Link check: %d link(s) removed from the list, %d kept." % (len(gone), len(kept)))
+
     def pump():
         try:
             while True:
@@ -3543,12 +4230,33 @@ def main_gui():
             c_ev.set()
         except queue.Empty:
             pass
+        rows = checker.tick(current_links(), v["TOKEN"].get().strip(), collect_cfg)
+        if rows:
+            handle_problems(rows)
         t = state["thread"]
         if t is not None and not t.is_alive():
             state["thread"] = None
             tb_finish()
             start_btn.configure(state="normal")
             stop_btn.configure(state="disabled")
+        if state["thread"] is None:
+            waiting = checker.unsettled(current_links())
+            want = "disabled" if waiting else "normal"
+            if str(start_btn.cget("state")) != want:
+                start_btn.configure(state=want)
+            if waiting:
+                start_ctx["lock_since"] = start_ctx["lock_since"] or time.time()
+                if time.time() - start_ctx["lock_since"] > 3 and not start_ctx["lock_told"]:
+                    start_ctx["lock_told"] = True
+                    log("START is locked until %d link(s) are checked and decided." % waiting)
+            else:
+                start_ctx["lock_since"], start_ctx["lock_told"] = None, False
+                if start_ctx["pending"]:
+                    start_ctx["pending"], start_ctx["force"] = False, True
+                    try:
+                        start()
+                    finally:
+                        start_ctx["force"] = False
         bridge_lbl.configure(text=bridge_status())
         tb_tick()
         if (not launch_state["asked"] and BRIDGE.connected() and sys.platform.startswith("win")
@@ -3623,6 +4331,7 @@ def main_gui():
             d["RECENT"] = list(recent["PATH"])
             d["RECENT_PREFIX"] = list(recent["PREFIX"])
             d["RECENT_SUB"] = list(recent["IMGFOLDER"])
+            d["PREFIX_BY_PATH"] = dict(prefix_map)
             d["WINDOW"] = window_state()
             with open(SETTINGS, "w", encoding="utf-8") as f:
                 json.dump(d, f, ensure_ascii=False, indent=1)
@@ -3635,6 +4344,17 @@ def main_gui():
         if not urls:
             log("The link list is empty.")
             return
+        if checker.unsettled(urls):
+            log("The link check is still running - START works when it is done.")
+            return
+        if not start_ctx["force"]:
+            again = checker.recheck_kept(urls)
+            if again:  # nothing is remembered about "keep": the links are asked about once more
+                start_ctx["pending"] = True
+                log("Checking again the %d link(s) you chose to keep ..." % again)
+                return
+        KEPT_LINKS.clear()
+        KEPT_LINKS.update(u for u in urls if checker.state.get(u) == "kept")
         if not cfg["DSCR"] and cfg["DSCR_AS_MODEL"] != "1":
             if not messagebox.askyesno("Civitai Grabber", "The description file name is empty: no description and no "
                                                           "generation metadata will be written.\n\nContinue anyway?"):
@@ -3676,7 +4396,6 @@ def main_gui():
     lock_btn.configure(command=lambda: set_lock(str(e_token.cget("state")) != "readonly"))
     signin_btn.configure(command=do_signin)
     refresh_signin_ui()
-    browse_btn.configure(command=browse_dir)
     sample_btn.configure(command=create_sample)
     load_btn.configure(command=load_txt)
     start_btn.configure(command=start)
@@ -3696,12 +4415,19 @@ def main_gui():
         for item in reversed(saved.get(skey) or []):
             push_recent(key, item)
     set_values({**DEFAULTS, **{k: x for k, x in saved.items() if k in DEFAULTS}})
+    existing_var.set("Ask")  # the "If already downloaded" box is hidden for now: always ask
     sync_fields()
     urlbox.insert("1.0", saved.get("URLS", ""))
     urlbox.edit_reset()
+    if isinstance(saved.get("PREFIX_BY_PATH"), dict):
+        prefix_map.update({str(k): str(x) for k, x in saved["PREFIX_BY_PATH"].items()})
+    refresh_link()
+    v["PATH"].trace_add("write", on_path_change)
+    v["PREFIX"].trace_add("write", on_prefix_change)
     for key in ("PATH", "PREFIX", "IMGFOLDER"):
         if not recent[key]:
             push_recent(key, v[key].get())
+    path_combo.configure(values=[BROWSE_LABEL] + recent["PATH"])  # the first line is always there, even when the list is empty
 
     def restore_sash():
         frac = (saved.get("WINDOW") or {}).get("sash")
@@ -3711,11 +4437,9 @@ def main_gui():
         except Exception:  # noqa
             pass
         balance_actions()
-        align_rows()
 
     root.after(300, restore_sash)
     root.after(700, balance_actions)
-    root.after(800, align_rows)
     if launcher_registered():  # keep the entry pointing at the script that runs now (moved / updated file)
         register_launcher()
     BRIDGE.launcher = launcher_registered()
