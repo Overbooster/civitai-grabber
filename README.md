@@ -13,7 +13,7 @@ Made first of all for the author's own workflow and shared as-is: you are welcom
 **Status: public beta.** The latest version is on the [Releases](../../releases) page. It works for the author,
 but it has been tested on very few machines. Bug reports are welcome (see below).
 
-<img width="922" height="745" alt="Civitai Grabber" src="https://github.com/user-attachments/assets/56be69f8-3c55-4710-9a6b-e2e7e6f2c225" />
+<img width="922" height="745" alt="Civitai Grabber" src="https://github.com/user-attachments/assets/b8d0f6b2-c699-41d9-b874-731a1a573073" />
 
 
 ## What you need
@@ -28,28 +28,60 @@ but it has been tested on very few machines. Bug reports are welcome (see below)
 ## Quick start
 
 1. Download `civitai_grabber.pyw` from the latest [Release](../../releases) (or the whole repository:
-   green **Code** button -> **Download ZIP**) and put it in a folder of its own: the program keeps its settings and
-   log next to itself.
+  green **Code** button -> **Download ZIP**) and put it in a folder of its own: the program keeps its settings and
+  log next to itself.
 2. Double-click `civitai_grabber.pyw`. Press **Sign in with Civitai** and allow the access in the browser tab
-   (or paste an API token instead). Choose the output folder, paste Civitai links
-   (model pages, `.../models/ID?modelVersionId=ID`, or single image pages `.../images/ID`) and press **START**.
+  (or paste an API token instead). Choose the output folder, paste Civitai links
+  (model pages, `.../models/ID?modelVersionId=ID`, or single image pages `.../images/ID`) and press **START**.
 3. For each model you get the file, `NN-example` images/videos with metadata, and the description file.
 
 The window has tooltips for every option. Settings can also be given in a plain text task file
 (see the comment at the top of `civitai_grabber.pyw`).
 
+## What the program checks when you add a link
+
+A moment after a model link appears in the list (pasted, typed, or sent by the browser extension), the program asks
+Civitai about it and shows a window if something is wrong:
+
+- the model is **paid** or in **early access** (the end date is shown) - unless your account has already bought it;
+- the model or version was **deleted or hidden**, or is not published;
+- the model is **already downloaded**;
+- a **folder with the same name already exists** and holds another model (or it is not known which one).
+
+For each warning you remove the link or keep it (for an existing folder the buttons are "Exclude link" and
+"Download anyway"). **START** stays locked until all checks are done and all warnings are answered; a link you kept
+because of a paid or missing model is checked again when you press START. If Civitai cannot be reached, the link
+simply stays in the list. Free models get no extra requests; for paid and early-access models the program sends one
+tiny test request to the file address to see whether your account already has the access. Nothing is created on
+disk for a model that cannot be downloaded. The taskbar button turns yellow while some link in the list carries a
+warning.
+
+## Folders, prefix and names
+
+- **Output folder** keeps the 12 folders used last; the first line of the list, *Add output folder...*, opens the
+  folder chooser.
+- **Prefix** is put in front of the model file name. The chain button next to the folder **links the prefix to that
+  folder**: whenever you choose the folder again, its prefix is filled in (joined rings: linked; rings apart: not linked,
+  or the prefix was changed after linking). Every folder has its own link; the prefix can always be edited.
+- **Name ID-like model files by title** (optional): a model file whose name is only an ID (26 random characters, as the
+  Civitai trainer makes them) is saved under the model's title - with the version name added when the model has several
+  versions. The original name is written to the description file.
+- Every model folder gets a small hidden file `.civitai-model.json` and the description file gets *Model ID* and *Version ID*
+  lines, so the program can later tell which model a folder belongs to. The description file of another model that
+  lies in the same folder is never overwritten.
+
 ## Two ways to authorize
 
 The program needs your Civitai account for some models and for reading image pages. There are two ways, and both can be set up at the same time:
 
-|  | Sign in with Civitai | API token |
-|---|---|---|
+|     | Sign in with Civitai | API token |
+| --- | --- | --- |
 | How | Press the button and allow the access in the browser tab | Create a key in Civitai (account settings -> API keys) and paste it |
 | Access | Read-only (profile, models, media), limited to this program | A personal key: treat it like a password |
 | Revoking | One click in your Civitai account (*Connected Apps*) | Delete the key in Civitai |
 | Renewal | Automatic (the access is renewed in the background every hour) | Not needed |
 | Stored in | `civitai_grabber_auth.json` | `civitai_grabber_settings.json` |
-| Log of a run | Shows your Civitai user name (hiding it is planned) | Does not show your user name |
+| Log of a run | Does not show your user name | Does not show your user name |
 | Needs | A browser and the local port 8765 free for a moment | Nothing |
 
 **Which one is used?** If you are signed in, the sign-in is used and the API token is ignored; after you sign out, the token is used again. The log of every run says which credentials were used and counts the requests (for example "Credentials used: OAuth 120 request(s), API token 0"), and lists any request that was refused although you were signed in. `civitai.red` and `civitai.com` are interchangeable: a sign-in on either site works for links of both.
@@ -72,11 +104,12 @@ own computer (127.0.0.1) and works with the Civitai pages in your browser.
 - **Images without a model link before them** go to the output folder itself (optionally into an
   image subfolder, see the option in the window). So to download gallery images separately, set the folder you
   want before pressing **START**.
+- If a model was downloaded before, the program asks what to do (skip it, or download it again).
 - At the moment the output folder and the other options apply to the whole current list; per-link folders are
   planned.
-- If a run is stopped or a model cannot be downloaded, the program offers to delete the incomplete files and the
-  empty folders it has created (nothing else is ever touched). An incomplete file is resumed when you download the
-  same link again.
+- Folders the program created and that stayed empty (a failed run, a stop) are removed without asking. If a run is
+  stopped or a download fails halfway, the program offers to delete the incomplete files (nothing else is ever
+  touched). An incomplete file is resumed when you download the same link again.
 
 ## Browser bridge (optional, recommended)
 
@@ -89,19 +122,20 @@ provides:
   the list.
 
 It can also close the browser tab of a finished link: *Never*, *Always*, or *Ask* (the extension window then shows a
-list of the finished pages with check boxes, and you choose which to close and which to keep open).
+list of the finished pages with check boxes, and you choose which to close and which to keep open). Pages where
+something was not downloaded, or whose link carries a warning, stay open and appear in the extension's **Needs attention**
+list; when you remove such a link in the program, it disappears from that list too.
 
 **Installation** (the files are in the latest [Release](../../releases); the same code is in the `bridge` folder of this repository):
 
-- **Firefox:** use the method that matches the file the Release offers:
-  - **a signed `.xpi`:** download it and open it in Firefox (or go to `about:addons` -> gear icon -> *Install Add-on From File*
-    and select the `.xpi`). It is signed by Mozilla, so it stays installed after Firefox is restarted.
-  - **a `.zip`:** download it, open `about:debugging#/runtime/this-firefox`, click *Load Temporary Add-on* and select the
-    downloaded `.zip` file. It works fully, but Firefox forgets it on restart, so it must be loaded again.
+- **Firefox 140 or newer** (Firefox for Android: 142): download the signed `.xpi` from the Release and open it in Firefox
+  (or go to `about:addons` -> gear icon -> *Install Add-on From File* and select the `.xpi`). It is signed by Mozilla,
+  so it stays installed after Firefox is restarted, and Firefox updates it by itself.
 - **Chrome / Edge / Brave / Chromium:** unpack the Chromium zip from the Release (or use the folder
   `bridge/chromium` of this repository), open `chrome://extensions`, turn on *Developer mode*,
   *Load unpacked* and select that folder. The extension keeps a fixed ID, so the program recognises it
-  automatically. Do not delete or move the folder afterwards.
+  automatically. Do not delete or move the folder afterwards. To update, replace the files in that folder and press
+  the reload button on the extension's card.
 
 When the program is closed, the extension window offers a **Start Civitai Grabber** button; for this the
 program asks your permission once and adds a small entry for each browser it can launch from
@@ -109,7 +143,7 @@ program asks your permission once and adds a small entry for each browser it can
 
 ## Known limits
 
-- Paid (Buzz-only) and login-protected models cannot be downloaded.
+- Paid models you have not bought cannot be downloaded (the program warns beforehand).
 - Very long Windows paths (over 260 characters) are not handled.
 - Opera, Vivaldi and Yandex Browser are not covered by the start-from-browser button yet.
 - Linux and macOS have not been tested. The downloader is plain Python and may work there, but the
@@ -118,8 +152,8 @@ program asks your permission once and adds a small entry for each browser it can
 ## Bug reports
 
 Open an **Issue** and attach `civitai_grabber.log`, the program version (shown in the window title) and what you
-expected to happen. A screenshot helps. The log contains no tokens, but it does contain your Civitai user name and
-the paths of your folders: look through it before you post it. The pages saved in the `debug` folder contain
+expected to happen. A screenshot helps. The log contains no tokens and no user name, but it does contain the paths of your
+folders: look through it before you post it. The pages saved in the `debug` folder contain
 your browser session: never share them.
 
 ## Credits
