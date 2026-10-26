@@ -128,9 +128,11 @@ list; when you remove such a link in the program, it disappears from that list t
 
 **Installation** (the files are in the latest [Release](../../releases); the same code is in the `bridge` folder of this repository):
 
-- **Firefox 140 or newer** (Firefox for Android: 142): download the signed `.xpi` from the Release and open it in Firefox
-  (or go to `about:addons` -> gear icon -> *Install Add-on From File* and select the `.xpi`). It is signed by Mozilla,
-  so it stays installed after Firefox is restarted, and Firefox updates it by itself.
+- **Firefox 140 or newer** (Firefox for Android: 142): open the latest Release and click the signed `.xpi` file in the
+Assets list; Firefox asks whether to install it - confirm with *Add*. It is signed by Mozilla, so it stays installed after
+Firefox is restarted, and Firefox updates it by itself (it checks once a day, or use `about:addons` -> gear icon ->
+*Check for Updates*). Please install it this way: an add-on installed through *Install Add-on From File* did not update
+in our tests.
 - **Chrome / Edge / Brave / Chromium:** unpack the Chromium zip from the Release (or use the folder
   `bridge/chromium` of this repository), open `chrome://extensions`, turn on *Developer mode*,
   *Load unpacked* and select that folder. The extension keeps a fixed ID, so the program recognises it
