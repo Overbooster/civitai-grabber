@@ -9,6 +9,11 @@
         {
           "version": "0.16.0",
           "update_link": "https://github.com/Overbooster/civitai-grabber/releases/download/v0.35/civitai-grabber-bridge-firefox-0.16.0.xpi"
+        },
+        {
+          "version": "0.17.0",
+          "update_link": "https://github.com/Overbooster/civitai-grabber/releases/download/v0.40/civitai-grabber-bridge-firefox-0.17.0.xpi",
+          "applications": { "gecko": { "strict_min_version": "140.0" } }
         }
       ]
     }
