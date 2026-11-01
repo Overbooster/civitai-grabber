@@ -13,7 +13,7 @@ Made first of all for the author's own workflow and shared as-is: you are welcom
 **Status: public beta.** The latest version is on the [Releases](../../releases) page. It works for the author,
 but it has been tested on very few machines. Bug reports are welcome (see below).
 
-<img width="738" height="729" alt="Civitai Grabber 047" src="https://github.com/user-attachments/assets/967fc3ca-9589-4228-be90-64f5b77e9642" />
+<img width="738" height="729" alt="Civitai Grabber 047" src="https://github.com/user-attachments/assets/6d094b42-576b-4576-b16d-8df91d53c751" />
 
 
 ## What you need
