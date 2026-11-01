@@ -162,7 +162,7 @@ list; when you remove such a link in the program, it disappears from that list t
 and the signed `.xpi` 0.17.0 (the same code; only the Firefox manifest differs).
 
 - **Firefox 140 or newer (desktop), recommended:** install it from the Firefox Add-ons site:
-  [Civitai Grabber Bridge](https://addons.mozilla.org/firefox/search/?q=Civitai%20Grabber%20Bridge) -> *Add to Firefox*.
+  [Civitai Grabber Bridge](https://addons.mozilla.org/en-US/firefox/addon/civitai-grabber-bridge/) -> *Add to Firefox*.
   Firefox then updates it by itself.
 - **Firefox, the other way** (also Firefox for Android 142 or newer): open the latest Release and click the signed `.xpi`
   file in the Assets list; Firefox asks whether to install it - confirm with *Add*. It is signed by Mozilla, so it stays
