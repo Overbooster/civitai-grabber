@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Civitai Grabber v0.40 - batch downloader for Civitai LoRA models and their example
+Civitai Grabber v0.47 - batch downloader for Civitai LoRA models and their example
 images/videos with generation metadata. Python 3.8+, standard library only
 (Tkinter is included in the Windows installer from python.org).
 
@@ -61,7 +61,7 @@ import secrets
 import webbrowser
 from html.parser import HTMLParser
 
-VERSION = "0.40"
+VERSION = "0.47"
 
 # ======================================================================================================
 # SWITCHES - change True/False here, nothing else needs editing
@@ -91,7 +91,7 @@ STATE = {"log": None, "bridge_failures": 0, "bridge_off": False, "stop": None, "
 
 DEFAULTS = {"BRIDGE": "1", "TOKEN": "", "PATH": "", "PREFIX": "", "PICS": "4", "VIDEO": "1", "ORIGINAL": "1",
             "COMFY": "0", "EXISTING": "ask", "IMGFOLDER": "", "USE_SUBFOLDER": "0", "DSCR": "dscr.txt", "DSCR_AS_MODEL": "0", "MODEL": "1", "GALLERY": "0",
-            "WEBP2JPG": "0", "RENAME_ID": "0"}
+            "WEBP2JPG": "0", "RENAME_ID": "0", "USE_API": "0", "DARK": "0", "CHECK_UPDATES": "1"}
 
 
 SECRETS = set()  # strings (the API token) that must never appear in a log
@@ -816,6 +816,233 @@ class Auth:
 AUTH = Auth()
 
 
+# ---- failure diagnostics: a short assessment of WHY a request failed (a passing problem or a changed service?); log only
+DIAG = {"active": False, "seen": set(), "probed": set(), "fmt": set()}
+DIAG_TEXT = {  # class -> (what it means, is a probe of the network useful)
+    "dns": ("name lookup (DNS) failed", True),
+    "timeout": ("no answer in time", True),
+    "reset": ("the connection was closed by the other side or by something on the way", True),
+    "refused": ("the connection was refused", True),
+    "tls": ("secure connection (TLS / certificate) problem", True),
+    "unreachable": ("network or host unreachable", True),
+    "dropped": ("the download was interrupted before the end", True),
+    "server": ("server error", True),
+    "rate_limit": ("too many requests (rate limit)", False),
+    "cloudflare": ("a Cloudflare check page came instead of the data", False),
+    "auth": ("access denied (sign-in, rights, paid or early-access content)", False),
+    "not_found": ("not found (removed, hidden or a wrong address)", False),
+    "bad_request": ("the server did not accept the request", False),
+    "not_json": ("the answer is not JSON (a web page or an error page?)", False),
+    "html_instead_of_file": ("a web page came instead of the file", False),
+    "format": ("the answer has another structure than expected", False),
+    "other": ("unclassified error", True),
+}
+
+
+def diag_reset():
+    DIAG["seen"].clear()
+    DIAG["probed"].clear()
+    DIAG["fmt"].clear()
+
+
+def diag_layer(url):
+    """Which part of the service a request belongs to: api / page / files (storage and image servers)."""
+    try:
+        u = urllib.parse.urlparse(str(url))
+    except ValueError:
+        return "request"
+    host = (u.hostname or "").lower()
+    if "/api/download/" in u.path:
+        return "files"
+    if "/api/" in u.path:
+        return "api"
+    if host and host.split(".", 1)[0] not in ("civitai", "www") and not re.fullmatch(r"(www\.)?civitai\.(com|red)", host):
+        return "files"
+    return "page"
+
+
+def classify_error(exc, body=b""):
+    """-> {cls, detail}. Pure function: the exception (and, for an HTTP error, the start of the answer) decide."""
+    import ssl
+    code = exc.code if isinstance(exc, urllib.error.HTTPError) else None
+    if code is not None:
+        hdr = exc.headers if exc.headers is not None else {}
+        low = (body or b"")[:4000].lower()
+        server = str(hdr.get("Server") or "").lower()
+        retry = str(hdr.get("Retry-After") or "")
+        cf = (str(hdr.get("cf-mitigated") or "").lower() == "challenge" or b"just a moment" in low or b"cf-chl" in low
+              or b"challenge-platform" in low or ("cloudflare" in server and code in (403, 429, 503) and b"<html" in low))
+        if code == 429:
+            return {"cls": "rate_limit", "detail": "HTTP 429" + (", Retry-After %s" % retry if retry else "")}
+        if cf:
+            return {"cls": "cloudflare", "detail": "HTTP %s" % code}
+        if code in (401, 403):
+            return {"cls": "auth", "detail": "HTTP %s" % code}
+        if code in (404, 410):
+            return {"cls": "not_found", "detail": "HTTP %s" % code}
+        if code in (400, 422):
+            return {"cls": "bad_request", "detail": "HTTP %s" % code}
+        if code >= 500:
+            more = ", maintenance?" if (code == 503 and (retry or b"maintenance" in low)) else ""
+            return {"cls": "server", "detail": "HTTP %s%s%s" % (code, ", Retry-After %s" % retry if retry else "", more)}
+        return {"cls": "other", "detail": "HTTP %s" % code}
+    inner = exc
+    for _ in range(4):  # URLError wraps the real error in .reason
+        r = getattr(inner, "reason", None) if isinstance(inner, urllib.error.URLError) else None
+        if isinstance(r, BaseException):
+            inner = r
+        else:
+            break
+    text = str(inner)
+    win = getattr(inner, "winerror", None)
+    if isinstance(exc, json.JSONDecodeError) or isinstance(inner, json.JSONDecodeError):
+        return {"cls": "not_json", "detail": "invalid JSON"}
+    if isinstance(inner, socket.gaierror) or win == 11001:
+        return {"cls": "dns", "detail": text[:80]}
+    if isinstance(inner, (socket.timeout, TimeoutError)) or win == 10060 or "timed out" in text:
+        return {"cls": "timeout", "detail": "timed out"}
+    if isinstance(inner, (ssl.SSLError, getattr(ssl, "CertificateError", ssl.SSLError))) or "CERTIFICATE_VERIFY_FAILED" in text:
+        return {"cls": "tls", "detail": text[:80]}
+    if isinstance(inner, ConnectionRefusedError) or win == 10061:
+        return {"cls": "refused", "detail": "refused"}
+    if isinstance(inner, (ConnectionResetError, ConnectionAbortedError, http.client.RemoteDisconnected)) or win in (10054, 10053) \
+            or "forcibly closed" in text or "Connection reset" in text:
+        return {"cls": "reset", "detail": ("WinError %s" % win) if win else type(inner).__name__}
+    if isinstance(inner, (http.client.IncompleteRead, http.client.BadStatusLine)) or "connection dropped" in text:
+        return {"cls": "dropped", "detail": type(inner).__name__}
+    if win in (10051, 10065) or getattr(inner, "errno", None) in (101, 113):
+        return {"cls": "unreachable", "detail": "WinError %s" % win if win else "unreachable"}
+    return {"cls": "other", "detail": "%s: %s" % (type(inner).__name__, text[:80])}
+
+
+def diag_tcp(host, port, timeout=4):
+    """A bare TCP connection (no HTTP): -> (ok, reason)."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, ""
+    except OSError as e:
+        return False, classify_error(e)["cls"]
+
+
+def diag_http(url, timeout=6):
+    """One light request to the same host: -> (status or None, reason). Any answer, even 403/404, means the server is alive."""
+    try:
+        u = urllib.parse.urlparse(url)
+        probe = "%s://%s/" % (u.scheme or "https", u.netloc)
+        req = urllib.request.Request(probe, headers={"User-Agent": UA}, method="HEAD")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return getattr(r, "status", 200), ""
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except Exception as e:  # noqa
+        return None, classify_error(e)["cls"]
+
+
+def diag_probe(url, cls=""):
+    """The network around the failure: -> (facts, verdict). Run once per layer per task. A bare request to a storage or image host
+    proves nothing (they answer it badly), so the main site of the task is the yardstick for "is the service alive"."""
+    u = urllib.parse.urlparse(str(url))
+    host = u.hostname or ""
+    port = u.port or (80 if u.scheme == "http" else 443)
+    site = DIAG.get("site") or u.netloc
+    net = diag_tcp("1.1.1.1", 443)[0] or diag_tcp("8.8.8.8", 53)[0]
+    tcp = diag_tcp(host, port)
+    status, why = diag_http("%s://%s/" % (u.scheme or "https", site))
+    site_name = urllib.parse.urlparse("//" + site).hostname or site
+    facts = "internet %s; %s tcp %s; %s http %s" % ("ok" if net else "NO", host, "ok" if tcp[0] else "NO (%s)" % tcp[1], site_name,
+                                                    status if status else "none (%s)" % why)
+    if not net:
+        verdict = "the internet connection looks down - not a problem of the service"
+    elif not tcp[0]:
+        verdict = "the internet works but this host cannot be reached (network, a block, or the service is down)"
+    elif status is not None and status >= 500:
+        verdict = "the service answers with errors - an outage or maintenance; try later"
+    elif status is None and why == "timeout":
+        verdict = "the host accepts connections but does not answer a simple request - overloaded or throttling; try later"
+    elif status is None and why == "reset":
+        verdict = "even a simple request is cut - the service is overloaded or something on the way cuts connections (filter, VPN, antivirus)"
+    elif cls in ("reset", "timeout", "dropped"):
+        verdict = "the connection to the host works, but this transfer was cut - short hiccups of the file/image servers, server limits or a filter on the way; it usually passes"
+    else:
+        verdict = "the service answers normally - this request failed for its own reason"
+    return facts, verdict
+
+
+def diag_say(cls, layer, text, verdict="", final=False):
+    msg = "DIAG: %s | %s | %s%s" % (cls, layer, text, (" | " + verdict) if verdict else "")
+    file_log(msg)
+    if DIAG["active"]:
+        (STATE.get("log") or (lambda m: None))("  " + msg)
+
+
+def diag_event(exc, url, final=False):
+    """Called where a request failed. Prints one DIAG line for the first failure of a kind per task and a short one when the
+    request finally fails; never raises."""
+    try:
+        body = b""
+        if isinstance(exc, urllib.error.HTTPError):
+            try:
+                body = exc.read(4096)
+            except Exception:  # noqa
+                pass
+        if getattr(exc, "_diag_done", False) and not final:
+            return None
+        info = classify_error(exc, body)
+        layer = diag_layer(url)
+        key = (info["cls"], layer)
+        try:
+            exc._diag_done = True
+        except Exception:  # noqa
+            pass
+        first = key not in DIAG["seen"]
+        DIAG["seen"].add(key)
+        if not DIAG["active"] or not (first or final):
+            return info
+        what, probe = DIAG_TEXT.get(info["cls"], DIAG_TEXT["other"])
+        text = "%s (%s)" % (what, info["detail"])
+        verdict = ""
+        if first and probe and layer not in DIAG["probed"]:
+            DIAG["probed"].add(layer)
+            facts, verdict = diag_probe(url, info["cls"])
+            text += "; " + facts
+        elif not first:
+            text += "; again"
+        diag_say(info["cls"], layer, text, verdict)
+        return info
+    except Exception:  # noqa
+        return None
+
+
+# what the Civitai API is expected to contain (checked after every model / version request; a missing key is reported once per task)
+API_EXPECTED = {
+    "model": (("id", "name", "type", "modelVersions"), "modelVersions", ("id", "name")),
+    "version": (("id", "name", "files", "images", "modelId"), "files", ("name", "downloadUrl")),
+}
+
+
+def diag_format(data, kind, url=""):
+    try:
+        top, sub, subkeys = API_EXPECTED[kind]
+        if not isinstance(data, dict):
+            missing = ["(the answer is not an object)"]
+        else:
+            missing = [k for k in top if k not in data]
+            items = data.get(sub)
+            if isinstance(items, list) and items and isinstance(items[0], dict):
+                missing += ["%s[].%s" % (sub, k) for k in subkeys if k not in items[0]]
+        if not missing:
+            return
+        key = (kind, tuple(missing))
+        if key in DIAG["fmt"]:
+            return
+        DIAG["fmt"].add(key)
+        have = ", ".join(sorted(data.keys())[:25]) if isinstance(data, dict) else type(data).__name__
+        diag_say("format", diag_layer(url) if url else "api", "%s: missing %s; the answer has: %s" % (kind, ", ".join(missing), have),
+                 "the Civitai API may have changed - the program may not work correctly; tell the author")
+    except Exception:  # noqa
+        pass
+
+
 def http_get(url, token=None, timeout=60, retries=3):
     token = AUTH.fresh(token)
     headers = {"User-Agent": UA, "Accept": "*/*"}
@@ -829,12 +1056,15 @@ def http_get(url, token=None, timeout=60, retries=3):
                 return r.read()
         except urllib.error.HTTPError as e:
             last = e
-            if e.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+            again = e.code in (429, 500, 502, 503, 504) and attempt < retries - 1
+            diag_event(e, url, final=not again)
+            if again:
                 time.sleep(2 * (attempt + 1))
                 continue
             raise
         except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
             last = e
+            diag_event(e, url, final=attempt >= retries - 1)
             if attempt < retries - 1:
                 time.sleep(2 * (attempt + 1))
                 continue
@@ -1160,11 +1390,11 @@ def _png_rgba(w, h, rows):
             + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
 
 
-def chain_icon_png(linked, k=1.0):
+def chain_icon_png(linked, k=1.0, dark=False):
     """The 'link' icon: two rings; joined by a bar when linked, apart and paler when not. Drawn here (no image files),
     anti-aliased by supersampling. k scales it for high-resolution screens."""
     W, H, ss = int(round(30 * k)), int(round(16 * k)), 4
-    color = (60, 60, 60) if linked else (150, 150, 150)
+    color = ((60, 60, 60) if linked else (150, 150, 150)) if not dark else ((225, 225, 225) if linked else (120, 120, 120))
 
     def inside(x, y):
         x, y = x / k, y / k
@@ -1183,6 +1413,37 @@ def chain_icon_png(linked, k=1.0):
         rows.append(bytes(row))
     return _png_rgba(W, H, rows)
 
+
+
+def gear_icon_png(k=1.0, dark=False):
+    """The Setup gear: a ring with 8 teeth and a hole, drawn here (no font, no image file), anti-aliased by supersampling.
+    Design box 24 x 24; k scales it for high-resolution screens."""
+    import math
+    N, ss = int(round(24 * k)), 4
+    color = (225, 225, 225) if dark else (60, 60, 60)
+    teeth = [(math.cos(math.radians(a)), math.sin(math.radians(a))) for a in range(0, 360, 45)]
+
+    def inside(x, y):
+        x, y = x / k - 12.0, y / k - 12.0
+        r2 = x * x + y * y
+        if r2 <= 3.4 ** 2:
+            return False  # the hole
+        if r2 <= 7.6 ** 2:
+            return True  # the body
+        for c, s_ in teeth:
+            along, perp = x * c + y * s_, -x * s_ + y * c
+            if 0.0 <= along <= 10.8 and abs(perp) <= 2.1:
+                return True
+        return False
+
+    rows = []
+    for y in range(N):
+        row = bytearray()
+        for x in range(N):
+            n = sum(1 for sy in range(ss) for sx in range(ss) if inside(x + (sx + 0.5) / ss, y + (sy + 0.5) / ss))
+            row += bytes((color[0], color[1], color[2], int(255 * n / (ss * ss))))
+        rows.append(bytes(row))
+    return _png_rgba(N, N, rows)
 
 
 def get_json(url, token=None):
@@ -1385,7 +1646,7 @@ def check_availability(url, apikey):
         ver = get("%s://%s/api/v1/model-versions/%s" % (SCHEME, host, vid))
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            out.update(kind="notfound", text="Not found on %s: the model or version was deleted or is hidden." % host)
+            out.update(kind="notfound", text="Not found on %s: the model or version was deleted or is hidden - or it was published a moment ago and the API does not know it yet (check again in a minute)." % host)
         elif e.code in (401, 403):
             out.update(kind="denied", text="Civitai refused access (HTTP %s): sign in, or the model is restricted." % e.code)
         else:
@@ -1426,21 +1687,49 @@ def check_link(url, apikey, extra=None):
     return res
 
 
+def resolve_model_folder(path, name, model_id):
+    """Where a model goes: <path>/<name>. If that folder holds ANOTHER (or an unknown) model, the model goes into
+    a new folder "<name> (<model id>)". Returns a dict: folder (the one to use), base, alt, base_state, alt_state,
+    ids (models known in the base folder). A state is free (no folder / empty), same (holds this model),
+    other (holds another model) or unknown (has files, nobody knows whose)."""
+    base = os.path.join(path, safe_name(name))
+    mid = str(model_id or "")
+
+    def state(f):
+        if not os.path.isdir(f) or not [n for n in os.listdir(f) if n != MARKER]:
+            return "free", set()
+        ids = folder_model_ids(f)
+        if ids and mid in ids:
+            return "same", ids
+        return ("other" if ids else "unknown"), ids
+
+    bst, ids = state(base)
+    out = {"folder": base, "base": base, "alt": None, "base_state": bst, "alt_state": None, "ids": ids}
+    if bst in ("other", "unknown") and mid:
+        alt = "%s (%s)" % (base, mid)
+        out.update(folder=alt, alt=alt, alt_state=state(alt)[0])
+    return out
+
+
 def local_check(res, extra):
     path = (extra.get("PATH") or "").strip()
     if not path:
         return None
-    folder = os.path.join(path, safe_name(res["name"]))
-    if not os.path.isdir(folder):
+    r = resolve_model_folder(path, res["name"], res.get("model_id"))
+    folder = r["folder"]
+    if r["alt"]:
+        if r["alt_state"] == "free":  # the usual case: say so once, the model goes into a new folder
+            if r["base_state"] == "other":
+                why = "A folder with this name already exists, but it holds another model (id %s):" % ", ".join(sorted(r["ids"]))
+            else:
+                why = "A folder with this name already exists and has files in it; it is not known which model it holds:"
+            return {"kind": "folder", "text": "%s\n%s\n\nThis model will be saved into a new folder:\n%s" % (why, r["base"], r["alt"])}
+        if r["alt_state"] in ("other", "unknown"):  # even the new name is taken by something else
+            return {"kind": "folder", "text": "A folder with this name already exists, and the new-folder name is taken as well:\n%s\n"
+                                              "It holds another model or an unknown one." % r["alt"]}
+    state = r["alt_state"] if r["alt"] else r["base_state"]
+    if state == "free":
         return None
-    items = [n for n in os.listdir(folder) if n != MARKER]
-    if not items:
-        return None
-    ids = folder_model_ids(folder)
-    mid = str(res.get("model_id") or "")
-    if ids and mid not in ids:
-        return {"kind": "folder", "text": "A folder with this name already exists, but it holds another model (id %s):\n%s" % (
-            ", ".join(sorted(ids)), folder)}
     if flag(extra, "MODEL") and str(extra.get("EXISTING", "ask")).lower() != "overwrite" and res.get("primary"):
         orig = safe_name(res["primary"], 200)
         pre = extra.get("PREFIX", "")
@@ -1456,8 +1745,6 @@ def local_check(res, extra):
                 rec = history_find("model:%s" % res.get("vid"))
                 when = (" on %s" % rec["time"][:16]) if rec else ""
                 return {"kind": "downloaded", "text": "This version is already downloaded%s:\n%s" % (when, fp)}
-    if not ids:
-        return {"kind": "folder", "text": "A folder with this name already exists and has files in it; it is not known which model it holds:\n%s" % folder}
     return None
 
 
@@ -1698,6 +1985,9 @@ def download_file(url, dest, log, stop, token=None, attempts=5, auto_ext=False, 
             if ext == ".jpg" and name_ext.lower() in (".jpg", ".jpeg"):
                 ext = name_ext
             final = dest + ext
+        if ctype.lower().startswith("text/html") and os.path.getsize(tmp) < 2000000:  # a page instead of the file: say so (the file is kept as before)
+            diag_say("html_instead_of_file", diag_layer(base_url), "content-type %s, %d bytes" % (ctype, os.path.getsize(tmp)),
+                     "the server sent a web page instead of the file (sign-in needed, a protection page or an error page): check what was saved")
         os.replace(tmp, final)
         STATE["parts"].discard(tmp)
         TB["cur"] = 0.0
@@ -1752,12 +2042,14 @@ def download_file(url, dest, log, stop, token=None, attempts=5, auto_ext=False, 
         except urllib.error.HTTPError as e:
             if e.code == 416 and have:  # nothing left to resume - the file is complete
                 return finish()
+            diag_event(e, base_url, final=not (e.code in (429, 500, 502, 503, 504) and attempt < attempts))
             if e.code in (429, 500, 502, 503, 504) and attempt < attempts:
                 log("    server answered %s, retry %d/%d" % (e.code, attempt, attempts - 1))
                 stop.wait(3 * attempt)
                 continue
             raise
         except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            diag_event(e, base_url, final=attempt >= attempts or bool(STATE.get("net_down")))
             if attempt >= attempts or STATE.get("net_down"):
                 raise
             wait = 3 * attempt
@@ -2469,6 +2761,8 @@ def grab_example(n, item, host, token, folder, cfg, log, stop, overwrite):
     except Exception as e:  # noqa
         log("  [%02d] DOWNLOAD ERROR: %s" % (n, e))
         file_log("example error: %r" % (e,))
+        if isinstance(e, (urllib.error.URLError, OSError, http.client.HTTPException)):
+            diag_event(e, urls[0], final=True)
         if isinstance(e, (urllib.error.URLError, OSError, http.client.HTTPException)) and not isinstance(e, urllib.error.HTTPError):
             STATE["net_fail"] += 1
             if STATE["net_fail"] >= 2 and not STATE["net_down"]:
@@ -2564,13 +2858,19 @@ def process_model(url, cfg, log, stop, ask, next_is_image=False):
     vid = urllib.parse.parse_qs(p.query).get("modelVersionId", [None])[0]
 
     model = get_json("%s://%s/api/v1/models/%s" % (SCHEME, host, model_id), token)
+    diag_format(model, "model", "%s://%s/api/v1/models/%s" % (SCHEME, host, model_id))
     if not vid:
         vid = model["modelVersions"][0]["id"]
     ver = get_json("%s://%s/api/v1/model-versions/%s" % (SCHEME, host, vid), token)
+    diag_format(ver, "version", "%s://%s/api/v1/model-versions/%s" % (SCHEME, host, vid))
 
     name = model.get("name") or (ver.get("model") or {}).get("name") or ("model_%s" % model_id)
-    folder = os.path.join(cfg["PATH"], safe_name(name))
+    rf = resolve_model_folder(cfg["PATH"], name, model_id)
+    folder = rf["folder"]
     log("  Model: %s  (version: %s)" % (name, ver.get("name")))
+    if rf["alt"]:
+        log("  A folder named %s already holds %s - this model goes into a new folder" % (
+            os.path.basename(rf["base"]), ("another model (id %s)" % ", ".join(sorted(rf["ids"]))) if rf["ids"] else "something not known to be this model"))
     log("  Folder: %s" % folder)
     STATE["model_folder"] = folder  # images that follow in the list go here
     STATE["model_name"] = name
@@ -2911,25 +3211,32 @@ WHAT IT DOES
 Downloads LoRA/model files from Civitai model links together with their example images and videos, and writes the generation metadata (prompt, sampler, seed ...) into a description file next to the model. Links to single images work too.
 
 QUICK START
-1. Paste your Civitai API key (account settings -> API keys) into "API token" and press Lock to protect it. Choose an "Output folder" (a category folder: one kind of models per folder).
+1. Connect: tick "Connect via Sign-in" (recommended; a browser window opens), or tick "Connect via API" and paste your Civitai API key (account settings -> API keys) in Setup, tab Connection. While you are signed in, the sign-in has priority over the API token. Hover over a box to see its state. Choose an "Output folder" (a category folder: one kind of models per folder).
 2. Put links into the list, one per line: model links (.../models/ID?modelVersionId=ID) and/or image links (.../images/ID).
 3. Press START. Finished links disappear from the list, failed ones stay.
 
 WHERE THINGS GO
 - Every model gets its own folder inside the Output folder, named after the model (characters that Windows does not allow are replaced).
+- If a folder with that name already holds ANOTHER model (or one nobody can identify), the new model goes into a separate folder named "Model name (model id)". The same model later finds its own folder again.
 - Image links that follow a model link in the list go into that model's folder, continue the numbering and add their metadata to the same description file. A new model link starts a new folder. The model folder is remembered only within one run.
 - Image links with no model link before them go to the Output folder, or into the subfolder when "Image subfolder" is ticked (a name, a nested path a/b/c, or a full path).
 - A model link is removed from the list only after the image links below it are finished, so after a Stop or an error the rest of the list still knows its folder.
 
 OPTIONS
 Model file: tick to download the model file; the prefix box is used only then. Examples: how many example images/videos of the model version to download (number, all, or 0/empty for none; videos count). From gallery: how many images that other users uploaded to the model's gallery to download (number or all; needs the browser bridge, so the box is greyed out without it). 
-If a model or image was downloaded before, the program asks (the box that chose between ask / skip / download again is hidden for now; a task file can still set EXISTING). Images already saved to a different folder are never treated as downloaded.
+If a model or image was downloaded before, the program does what Setup says: asks (default), skips it, or downloads it again (a task file can set EXISTING too). Images already saved to a different folder are never treated as downloaded.
 Add prefix: text put before the model file name. Description file: name of the description file (.txt or .md, no extension = .txt; empty = no description file is written). "Name as model" names that file after the model instead (the extension still comes from the box).
 Original file names: try to read the original name from the image page. WebP to JPG needs the Pillow library (py -m pip install pillow).
 ComfyUI workflow as .json: experimental, saves the workflow found in the metadata next to the image.
 
 LINK CHECK
-A moment after a model link appears in the list (pasted, typed, or sent by the browser extension) the program asks Civitai whether it can be downloaded now. A paid model, a model in early access (with its end date), a deleted or hidden model, or an unpublished version is reported in a window: you remove the link from the list or keep it. START stays locked until all checks are done and answered. Links that are already downloaded, or whose model folder already exists with another (or an unknown) model in it, are reported in the same way (for an existing folder the buttons are "Exclude link" / "Download anyway"). A kept availability problem is checked again when you press START. If Civitai cannot be reached, the link simply stays in the list. Paid and early-access links get one extra one-byte test request to the file address (it shows whether your account already bought the access); free models get no test request.
+A moment after a model link appears in the list (pasted, typed, or sent by the browser extension) the program asks Civitai whether it can be downloaded now. A paid model, a model in early access (with its end date), a deleted or hidden model, or an unpublished version is reported in a window: you remove the link from the list or keep it. START stays locked until all checks are done and answered. Links that are already downloaded, or whose model folder already exists with another (or an unknown) model in it, are reported in the same way (for an existing folder the buttons are "Exclude link" / "Download to new folder"). A kept availability problem is checked again when you press START. If Civitai cannot be reached, the link simply stays in the list. Paid and early-access links get one extra one-byte test request to the file address (it shows whether your account already bought the access); free models get no test request.
+
+SETUP
+The gear button at the top right (left of the question mark) opens Setup: options that are rarely changed. Changes apply at once. Tab Downloads: what to do with already downloaded items (Ask / Skip / Download again), the description file name (and "Name as model"), the image subfolder, videos, original file names, WebP to JPG, naming of ID-like model files, the experimental ComfyUI workflow .json. Tab Connection: the API token. Tab Program: how many recent output folders and prefixes the lists remember (5 to 30), the dark theme, and the update check (at start, at most once in 12 hours, the program asks github.com which release is the newest; if it is newer than this one, a link "Update ..." appears at the top right; nothing is downloaded or installed by the program).
+
+FAILURE DIAGNOSTICS
+When a request fails, the log gets a line "DIAG: class | part of the service | facts | conclusion". Classes: dns, timeout, reset, refused, tls, unreachable, dropped, server, rate_limit, cloudflare, auth, not_found, bad_request, not_json, html_instead_of_file, format. Parts: api (the Civitai API), page (web pages), files (file and image servers). At the first failure in a part the program also looks at the network around it: a bare connection to a neutral address (1.1.1.1, else 8.8.8.8), a bare connection to the host, one simple request to the Civitai site; the conclusion says whether it looks like your internet connection, that host, or the service itself. "format" means that the Civitai API answers with another structure than expected: the program may stop working correctly, please tell the author. The lines only go to the log; no data about you is sent anywhere.
 
 PREFIX LINK
 The chain button after the prefix links the prefix typed now to the current output folder. Every folder has its own link; folders without a link keep working as before. When a linked folder is chosen (Browse, the drop-down list, typing), its prefix is filled in. Joined rings: linked (click to unlink); rings apart: not linked, or the prefix was changed after linking (click to link the prefix typed now). The prefix can always be edited.
@@ -2964,6 +3271,19 @@ def link_key(u):
 
 
 def run_task(cfg, urls, log, stop, ask, done=None):
+    diag_reset()
+    try:
+        DIAG["site"] = urllib.parse.urlparse(str(urls[0])).netloc if urls else ""
+    except ValueError:
+        DIAG["site"] = ""
+    DIAG["active"] = True  # DIAG lines go to the log only while a task runs (not while links are merely being checked)
+    try:
+        return _run_task(cfg, urls, log, stop, ask, done)
+    finally:
+        DIAG["active"] = False
+
+
+def _run_task(cfg, urls, log, stop, ask, done=None):
     """Processes the links in order. done(url) is called for every link that is finished, so the
     caller can remove it from its list. A model link is reported as finished only after all
     single-image links directly below it are finished too; if the run is stopped or an image fails,
@@ -3050,10 +3370,15 @@ def run_task(cfg, urls, log, stop, ask, done=None):
             AUTH.note_error(e.code, e.url)
             log("  HTTP ERROR %s: %s%s  (...%s)%s" % (e.code, e.reason, hint, str(e.url)[-70:], AUTH.tag()))
             file_log("HTTPError %s %s" % (e.code, e.url))
+            if not getattr(e, "_diag_done", False):
+                diag_event(e, e.url, final=True)
             history_add(k, u, cfg["PATH"], "error HTTP %s" % e.code)
         except Exception as e:  # noqa
             log("  ERROR: %s: %s" % (type(e).__name__, e))
             file_log(traceback.format_exc())
+            if isinstance(e, (urllib.error.URLError, OSError, http.client.HTTPException, json.JSONDecodeError)) \
+                    and not getattr(e, "_diag_done", False):  # a failure already reported where it happened is not reported twice
+                diag_event(e, u, final=True)
             history_add(k, u, cfg["PATH"], "error %s" % type(e).__name__)
         seen[k] = ok
         if not ok:
@@ -3123,6 +3448,84 @@ class UndoEntry:
         return "break"
 
 
+UPDATE_REPO = "Overbooster/civitai-grabber"  # whose releases are checked for updates (a fork changes this)
+TIP_COLORS = {"bg": "#ffffe0", "fg": "#000000"}  # hover hints; changed by the dark theme
+
+
+def parse_version(text):
+    """'v0.46' -> (0, 46); versions are compared as tuples of numbers."""
+    return tuple(int(n) for n in re.findall(r"\d+", str(text or ""))[:4])
+
+
+def latest_release(repo, timeout=8):
+    """The newest release of a GitHub repository -> (tag, page address). The address /releases/latest answers with a redirect
+    to the page of the newest (not pre-)release; reading that redirect needs no API (the API allows few requests per hour)."""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect())
+    req = urllib.request.Request("https://github.com/%s/releases/latest" % repo, headers={"User-Agent": "CivitaiGrabber/" + VERSION})
+    try:
+        opener.open(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        m = re.search(r"/releases/tag/([^/?#]+)$", e.headers.get("Location") or "")
+        if e.code in (301, 302, 303, 307, 308) and m:
+            tag = urllib.parse.unquote(m.group(1))
+            return tag, "https://github.com/%s/releases/tag/%s" % (repo, m.group(1))
+        raise RuntimeError("no release found (HTTP %s)" % e.code)
+    raise RuntimeError("unexpected answer")
+
+
+def checkbox_png(px, checked, border, fill, mark, gap=0):
+    """A check box for the dark theme, px pixels square: a rounded square with a thick border, a tick when checked.
+    Anti-aliased by supersampling; colours are (r, g, b); gap = transparent columns on the right (space before the text)."""
+    s_, ss = px / 16.0, 4
+    R, W = 3.2 * s_, 2.0 * s_
+    pts = [(3.9 * s_, 8.3 * s_), (6.8 * s_, 11.2 * s_), (12.2 * s_, 5.0 * s_)]
+
+    def rr(x, y, inset, r):
+        lo, hi = inset, px - inset
+        if not (lo <= x <= hi and lo <= y <= hi):
+            return False
+        cx, cy = min(max(x, lo + r), hi - r), min(max(y, lo + r), hi - r)
+        return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+
+    def on_tick(x, y):
+        for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+            dx, dy = x2 - x1, y2 - y1
+            t = max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / float(dx * dx + dy * dy)))
+            if (x - x1 - t * dx) ** 2 + (y - y1 - t * dy) ** 2 <= (1.15 * s_) ** 2:
+                return True
+        return False
+
+    rows = []
+    for y in range(px):
+        row = bytearray()
+        for x in range(px):
+            m, rs, gs, bs = 0, 0, 0, 0
+            for sy in range(ss):
+                for sx in range(ss):
+                    fx, fy = x + (sx + 0.5) / ss, y + (sy + 0.5) / ss
+                    if not rr(fx, fy, 0.5, R):
+                        continue
+                    if checked and on_tick(fx, fy):
+                        c = mark
+                    elif rr(fx, fy, 0.5 + W, max(R - W, 0.5)):
+                        c = fill
+                    else:
+                        c = border
+                    m += 1
+                    rs, gs, bs = rs + c[0], gs + c[1], bs + c[2]
+            if m:
+                row += bytes((rs // m, gs // m, bs // m, int(255 * m / (ss * ss))))
+            else:
+                row += bytes((0, 0, 0, 0))
+        row += bytes(4 * gap)
+        rows.append(bytes(row))
+    return _png_rgba(px + gap, px, rows)
+
+
 class Tooltip:
     """Small hover hint for a Tk widget."""
 
@@ -3143,12 +3546,13 @@ class Tooltip:
         self.job = None
         if self.tip is not None:
             return
+        text = self.text() if callable(self.text) else self.text
         x = self.widget.winfo_rootx() + 12
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
         self.tip = tk.Toplevel(self.widget)
         self.tip.wm_overrideredirect(True)
         self.tip.wm_geometry("+%d+%d" % (x, y))
-        tk.Label(self.tip, text=self.text, justify="left", background="#ffffe0", relief="solid",
+        tk.Label(self.tip, text=text, justify="left", background=TIP_COLORS["bg"], foreground=TIP_COLORS["fg"], relief="solid",
                  borderwidth=1, padx=6, pady=3, wraplength=380).pack()
 
     def _hide(self, _e=None):
@@ -3163,7 +3567,7 @@ class Tooltip:
 EXISTING_LABELS = [("Ask", "ask"), ("Skip", "skip"), ("Download again", "overwrite")]
 
 
-FLAG_KEYS = ("VIDEO", "ORIGINAL", "COMFY", "WEBP2JPG", "USE_SUBFOLDER", "BRIDGE", "DSCR_AS_MODEL", "MODEL", "RENAME_ID")
+FLAG_KEYS = ("VIDEO", "ORIGINAL", "COMFY", "WEBP2JPG", "USE_SUBFOLDER", "BRIDGE", "DSCR_AS_MODEL", "MODEL", "RENAME_ID", "USE_API", "DARK", "CHECK_UPDATES")
 TEXT_KEYS = ("TOKEN", "PATH", "PREFIX", "PICS", "IMGFOLDER", "DSCR", "GALLERY")
 
 
@@ -3178,10 +3582,31 @@ def load_settings():
 
 def main_gui():
     import tkinter as tk
-    from tkinter import ttk, filedialog, scrolledtext, messagebox
+    from tkinter import ttk, filedialog, messagebox
+    from tkinter import font as tkfont
+
+    class ScrollText(tk.Text):
+        """Like scrolledtext.ScrolledText, but with a ttk scrollbar (a tk scrollbar cannot be recoloured for the dark theme)."""
+
+        def __init__(self, master, **kw):
+            self.frame = ttk.Frame(master)
+            self.vbar = ttk.Scrollbar(self.frame, orient="vertical")
+            self.vbar.pack(side="right", fill="y")
+            kw["yscrollcommand"] = self.vbar.set
+            tk.Text.__init__(self, self.frame, **kw)
+            self.pack(side="left", fill="both", expand=True)
+            self.vbar["command"] = self.yview
+            for m in vars(tk.Pack).keys() | vars(tk.Grid).keys() | vars(tk.Place).keys():
+                if m[0] != "_" and m not in ("config", "configure"):
+                    setattr(self, m, getattr(self.frame, m))
+
     import tkinter.font as tkfont
 
     saved = load_settings()
+    if "USE_API" not in saved:  # settings of an older version: a saved token means the API connection was in use
+        saved["USE_API"] = "1" if str(saved.get("TOKEN") or "").strip() else "0"
+    if str(saved.get("TOKEN") or "").strip():
+        SECRETS.add(str(saved["TOKEN"]).strip())
     if sys.platform.startswith("win"):  # own identity in the taskbar (instead of "Python")
         try:
             import ctypes
@@ -3200,7 +3625,7 @@ def main_gui():
     except tk.TclError:
         pass
     root.title("Civitai Grabber v%s" % VERSION)
-    root.minsize(920, 580)
+    root.minsize(736, 580)
     mono = tkfont.nametofont("TkFixedFont").copy()
     mono.configure(size=9)
 
@@ -3212,7 +3637,7 @@ def main_gui():
         if not m:
             return "960x740+40+20"
         w, h, x, y = (int(m.group(i)) for i in range(1, 5))
-        w, h = max(920, min(w, sw)), max(580, min(h, sh))
+        w, h = max(736, min(w, sw)), max(580, min(h, sh))
         if x < -sw or x > 2 * sw - 100:
             x = 40
         if y < 0 or y > sh - 100:
@@ -3284,6 +3709,11 @@ def main_gui():
     RECENT_LIMIT = {"PATH": 12, "PREFIX": 12, "IMGFOLDER": 10}
     recent = {"PATH": [], "PREFIX": [], "IMGFOLDER": []}  # newest first; RECENT_LIMIT for folders/prefixes, 10 for image subfolders
     combos = {}
+    try:  # the number of remembered output folders (Setup); 5..30, default 12
+        RECENT_LIMIT["PATH"] = max(5, min(30, int(saved.get("RECENT_PATHS_LIMIT", 12))))
+        RECENT_LIMIT["PREFIX"] = RECENT_LIMIT["PATH"]  # the prefix list is always as long as the folder list
+    except (TypeError, ValueError):
+        pass
 
     v = {k: tk.StringVar() for k in TEXT_KEYS}
     b = {k: tk.BooleanVar() for k in FLAG_KEYS}
@@ -3294,47 +3724,46 @@ def main_gui():
     frm.pack(fill="x")
     frm.columnconfigure(1, weight=1)
 
-    ttk.Label(frm, text="API token:").grid(row=0, column=0, sticky="w", pady=2)
+    ttk.Label(frm, text="Connect:").grid(row=0, column=0, sticky="w", pady=2)
     row_tk = ttk.Frame(frm)
     row_tk.grid(row=0, column=1, columnspan=2, sticky="we", padx=(6, 0), pady=2)
-    e_token = ttk.Entry(row_tk, textvariable=v["TOKEN"], show="•", width=32)
-    e_token.pack(side="left", ipady=2)
-    lock_btn = ttk.Button(row_tk, text="Lock", width=9)
-    lock_btn.pack(side="left", padx=(6, 0))
-    signin_btn = ttk.Button(row_tk, text="Sign in with Civitai", width=24)
-    signin_btn.pack(side="left", padx=(6, 0))
+    signin_var = tk.BooleanVar(value=False)  # shows the real state: signed in or not
+    cb_signin = ttk.Checkbutton(row_tk, text="Connect via Sign-in", variable=signin_var)
+    cb_signin.pack(side="left")
+    cb_api = ttk.Checkbutton(row_tk, text="Connect via API", variable=b["USE_API"])
+    cb_api.pack(side="left", padx=(14, 0))
     cb_bridge = ttk.Checkbutton(row_tk, text="Browser bridge", variable=b["BRIDGE"])
-    cb_bridge.pack(side="right")
-    bridge_lbl = ttk.Label(row_tk, text="", width=26, anchor="e")
-    bridge_lbl.pack(side="right", padx=(0, 6))
+    cb_bridge.pack(side="left", padx=(14, 0))
 
     ttk.Label(frm, text="Output folder:").grid(row=1, column=0, sticky="w", pady=2)
     row_path = ttk.Frame(frm)
     row_path.grid(row=1, column=1, columnspan=2, sticky="we", padx=(6, 0), pady=2)
-    path_combo = ttk.Combobox(row_path, textvariable=v["PATH"], height=13)  # 12 recent folders + "Add output folder..." without a scroll bar
+    path_combo = ttk.Combobox(row_path, textvariable=v["PATH"], height=RECENT_LIMIT["PATH"] + 1)  # 12 recent folders + "Add output folder..." without a scroll bar
     path_combo.pack(side="left", fill="x", expand=True, ipady=2)
     combos["PATH"] = path_combo
     try:
         scale = min(3.0, max(1.0, root.winfo_fpixels("1i") / 96.0))
     except tk.TclError:
         scale = 1.0
-    icon_on = tk.PhotoImage(data=base64.b64encode(chain_icon_png(True, scale / 1.5)))
-    icon_off = tk.PhotoImage(data=base64.b64encode(chain_icon_png(False, scale / 1.5)))
-    link_btn = ttk.Label(row_path, image=icon_off, cursor="hand2")  # no button outline: just the chain
+    ICONS = {mode: {"on": tk.PhotoImage(data=base64.b64encode(chain_icon_png(True, scale / 1.5, mode == "dark"))),
+                    "off": tk.PhotoImage(data=base64.b64encode(chain_icon_png(False, scale / 1.5, mode == "dark")))}
+             for mode in ("light", "dark")}
+    icon_mode = {"cur": "light"}
+    link_btn = ttk.Label(row_path, image=ICONS["light"]["off"], cursor="hand2", padding=1, borderwidth=1, relief="flat", takefocus=True)  # no button outline: just the chain (a thin frame shows the keyboard focus)
     link_btn.pack(side="left", padx=(8, 4))
     lbl_prefix = ttk.Label(row_path, text="Prefix:")
     lbl_prefix.pack(side="left", padx=(4, 6))
-    prefix_box = ttk.Frame(row_path, width=110, height=26)  # its width is set so that the field starts under the "Browser bridge" box
+    prefix_box = ttk.Frame(row_path, width=110, height=26)  # its width is set so that the field starts above "From gallery:"
     prefix_box.pack(side="left")
     prefix_box.pack_propagate(False)
-    e_prefix = ttk.Combobox(prefix_box, textvariable=v["PREFIX"], height=12)
+    e_prefix = ttk.Combobox(prefix_box, textvariable=v["PREFIX"], height=RECENT_LIMIT["PREFIX"])
     e_prefix.pack(fill="both", expand=True, ipady=2)
     combos["PREFIX"] = e_prefix
 
     def align_prefix():
-        """The left edge of the prefix field = the left edge of the "Browser bridge" check square in the row above."""
+        """The left edge of the prefix field = the left edge of the "From gallery:" label in the Links row below."""
         root.update_idletasks()
-        left = cb_bridge.winfo_rootx() + CHECK_INDENT
+        left = lbl_gallery.winfo_rootx()
         w = row_path.winfo_rootx() + row_path.winfo_width() - left
         if w > 60:
             prefix_box.configure(width=w, height=e_prefix.winfo_reqheight() + 4)
@@ -3349,31 +3778,20 @@ def main_gui():
     frm.bind("<Configure>", align_later)
     root.after(150, align_later)
 
-    # row 3: description file (its label sits in the label column, so its field starts exactly under the fields above),
-    # then the image parameters in their natural order: examples, gallery, subfolder
-    ttk.Label(frm, text="Description file:").grid(row=2, column=0, sticky="w", pady=2)
-    row_dl = ttk.Frame(frm)
-    row_dl.grid(row=2, column=1, columnspan=2, sticky="we", padx=(6, 0), pady=2)
-    e_dscr = ttk.Entry(row_dl, textvariable=v["DSCR"], width=14)
-    e_dscr.pack(side="left", ipady=2)
-    cb_dname = ttk.Checkbutton(row_dl, text="Name as model", variable=b["DSCR_AS_MODEL"])
-    cb_dname.pack(side="left", padx=(8, 0))
-    ttk.Label(row_dl, text="Examples:").pack(side="left", padx=(16, 6))
-    e_pics = ttk.Entry(row_dl, textvariable=v["PICS"], width=6)
-    e_pics.pack(side="left", ipady=2)
-    ttk.Label(row_dl, text="From gallery:").pack(side="left", padx=(12, 6))
-    e_gal = ttk.Entry(row_dl, textvariable=v["GALLERY"], width=6)
-    e_gal.pack(side="left", ipady=2)
-    cb_sub = ttk.Checkbutton(row_dl, text="Image subfolder:", variable=b["USE_SUBFOLDER"])
-    cb_sub.pack(side="left", padx=(16, 6))
-    e_img = ttk.Combobox(row_dl, textvariable=v["IMGFOLDER"], width=12)
-    e_img.pack(side="left", fill="x", expand=True, ipady=2)  # grows with the window
-    combos["IMGFOLDER"] = e_img
+    setup_w = {}  # widgets of the Setup window that depend on other options (exist only while Setup is open)
 
-    def sync_fields(*_):  # greyed-out boxes: subfolder unless its box is ticked, prefix without Model file, name box with Name-as-model
-        e_img.configure(state="normal" if b["USE_SUBFOLDER"].get() else "disabled")
-        e_dscr.configure(state="disabled" if b["DSCR_AS_MODEL"].get() else "normal")
+    def sync_setup(*_):  # greyed-out boxes in Setup: subfolder unless its box is ticked, name box with Name-as-model
+        try:
+            if "e_img" in setup_w:
+                setup_w["e_img"].configure(state="normal" if b["USE_SUBFOLDER"].get() else "disabled")
+            if "e_dscr" in setup_w:
+                setup_w["e_dscr"].configure(state="disabled" if b["DSCR_AS_MODEL"].get() else "normal")
+        except tk.TclError:
+            pass
+
+    def sync_fields(*_):  # prefix is greyed out without Model file
         e_prefix.configure(state="normal" if b["MODEL"].get() else "disabled")
+        sync_setup()
 
     for key in ("USE_SUBFOLDER", "DSCR_AS_MODEL", "MODEL"):
         b[key].trace_add("write", sync_fields)
@@ -3388,20 +3806,23 @@ def main_gui():
     paned.add(bottom_pane, weight=3)
 
     hdr = ttk.Frame(top_pane)  # "Links" title on the left, option checkboxes on the right
-    hdr.pack(fill="x")
+    hdr.pack(fill="x", pady=(2, 0))
     ttk.Label(hdr, text="Links (one per line):").pack(side="left")
     cb_model = ttk.Checkbutton(hdr, text="Model file", variable=b["MODEL"])
-    cb_webp = ttk.Checkbutton(hdr, text="Convert WebP to JPG", variable=b["WEBP2JPG"])
-    cb_orig = ttk.Checkbutton(hdr, text="Original file names", variable=b["ORIGINAL"])
-    cb_video = ttk.Checkbutton(hdr, text="Include videos", variable=b["VIDEO"])
-    cb_rename = ttk.Checkbutton(hdr, text="Name ID-like model files by title", variable=b["RENAME_ID"])
-    cb_rename.pack(side="right")  # where "ComfyUI workflow as .json" (COMFY, hidden for now) used to be
-    for w in (cb_webp, cb_orig, cb_video, cb_model):  # from the right: Model file, videos, original names, WebP, ID rename
-        w.pack(side="right", padx=(0, 14))
+    count_values = ["all"] + [str(n) for n in range(0, 21)]  # typing any number or "all" still works
+    e_gal = ttk.Combobox(hdr, textvariable=v["GALLERY"], values=count_values, width=5, height=12)
+    e_pics = ttk.Combobox(hdr, textvariable=v["PICS"], values=count_values, width=5, height=12)
+    e_gal.pack(side="right", ipady=2)  # from the right: gallery, examples, model file (so they read left to right: Model file, Examples, From gallery)
+    lbl_gallery = ttk.Label(hdr, text="From gallery:")
+    lbl_gallery.pack(side="right", padx=(12, 6))
+    hdr.bind("<Configure>", align_later)
+    e_pics.pack(side="right", ipady=2)
+    ttk.Label(hdr, text="Examples:").pack(side="right", padx=(16, 6))
+    cb_model.pack(side="right")
     actions = ttk.Frame(top_pane, padding=(0, 10, 0, 6))
     actions.pack(side="bottom", fill="x")
-    urlbox = scrolledtext.ScrolledText(top_pane, height=6, wrap="none", font=mono, undo=True)
-    urlbox.pack(fill="both", expand=True, pady=(2, 0))
+    urlbox = ScrollText(top_pane, height=6, wrap="none", font=mono, undo=True)
+    urlbox.pack(fill="both", expand=True, pady=(8, 0))
 
     paste_btn = ttk.Button(actions, text="Paste")
     undo_btn = ttk.Button(actions, text="Undo", takefocus=False)
@@ -3420,9 +3841,11 @@ def main_gui():
         def __init__(self, master, **kw):
             f = tkfont.nametofont("TkDefaultFont").copy()
             f.configure(weight="bold")
-            tk.Button.__init__(self, master, font=f, relief="flat", bd=0, padx=18, pady=4, cursor="hand2",
+            bg = ttk.Style(master).lookup("TFrame", "background") or "#f0f0f0"
+            tk.Button.__init__(self, master, font=f, relief="flat", bd=0, padx=16, pady=2, cursor="hand2",
                                activebackground="#163f7a", activeforeground="#ffffff", disabledforeground="#ffffff",
-                               highlightthickness=0, **kw)
+                               highlightthickness=2, highlightbackground=bg, highlightcolor=bg, **kw)
+            self.ring_hidden, self.ring_shown = bg, "#163f7a"
             self._paint("normal")
             self.bind("<Enter>", lambda e: self._hover(True))
             self.bind("<Leave>", lambda e: self._hover(False))
@@ -3455,53 +3878,420 @@ def main_gui():
     openlog_btn = ttk.Button(logbtns, text="Open log file")
     copylog_btn.pack(side="left", padx=(0, 6))
     openlog_btn.pack(side="left")
-    help_btn = ttk.Button(logbtns, text="?", width=3)
-    help_btn.pack(side="right")
-    box = scrolledtext.ScrolledText(bottom_pane, wrap="word", state="disabled", font=mono)
+    help_btn = ttk.Button(row_tk, text="?", width=3)
+    help_btn.pack(side="right", before=cb_signin)  # packed before the left-hand boxes: when the window is narrow they keep their room
+    GEARS = {mode: tk.PhotoImage(data=base64.b64encode(gear_icon_png(scale / 1.5, mode == "dark"))) for mode in ("light", "dark")}
+    setup_btn = ttk.Button(row_tk, image=GEARS["light"], width=3)  # the gear: Setup (a drawn picture, the same on every system)
+    setup_btn.pack(side="right", padx=(0, 6), before=cb_signin)
+    upd_font = tkfont.nametofont("TkDefaultFont").copy()
+    upd_font.configure(underline=True)
+    upd_lbl = ttk.Label(row_tk, text="", cursor="hand2", font=upd_font, foreground="#0b57d0", padding=1, borderwidth=1, relief="flat",
+                        takefocus=True)  # "New version ..." link; shown only when a newer release exists
+    box = ScrollText(bottom_pane, wrap="word", state="disabled", font=mono)
     box.pack(fill="both", expand=True)
 
+    # ---- keyboard: Tab / Shift+Tab leave the text boxes (no tab characters), Enter presses the focused button
+    kbd = {"tab": 0.0}  # when Tab was last pressed: tells keyboard focus from focus given by a mouse click
+
+    def note_tab(_e=None):
+        kbd["tab"] = time.time()
+
+    root.bind_all("<KeyPress-Tab>", note_tab, "+")
+    root.bind_all("<ISO_Left_Tab>", note_tab, "+")
+
+    def tab_out(widget):
+        def go(_e, back=False):
+            note_tab()
+            nxt = widget.tk_focusPrev() if back else widget.tk_focusNext()
+            if nxt:
+                nxt.focus_set()
+            return "break"
+        widget.bind("<Tab>", go)
+        widget.bind("<Shift-Tab>", lambda e: go(e, True))
+        widget.bind("<ISO_Left_Tab>", lambda e: go(e, True))
+
+    tab_out(urlbox)
+    tab_out(box)
+    for sb in (urlbox.vbar, box.vbar):
+        sb.configure(takefocus=0)
+    # Tab order follows the stacking order of the widgets, which is the order of creation: put it in the order of the screen
+    for w in (upd_lbl, setup_btn, help_btn, cb_model, e_pics, e_gal, actions):
+        w.lift()
+    for cls in ("TButton", "Button"):
+        root.bind_class(cls, "<Return>", lambda e: (e.widget.invoke(), "break")[1])
+
+    def strip_focus(layout):  # a ttk layout without its dotted focus rectangle
+        out = []
+        for name, opts in layout:
+            opts = dict(opts or {})
+            kids = strip_focus(opts["children"]) if opts.get("children") else []
+            if name.endswith(".focus"):
+                for kn, ko in kids:
+                    ko = dict(ko)
+                    for key in ("side", "sticky", "expand"):
+                        if key in opts:
+                            ko[key] = opts[key]
+                    out.append((kn, ko))
+                continue
+            if kids:
+                opts["children"] = kids
+            out.append((name, opts))
+        return out
+
+    def calm_focus(w):
+        """The focus rectangle of a button/box stays while the keyboard is used (Tab), but a rectangle left by a mouse click
+        (or by returning to the window) fades after 3 seconds; the focus itself does not move."""
+        if isinstance(w, StartButton):
+            show = lambda: w.configure(highlightcolor=w.ring_shown)  # noqa: E731
+            hide = lambda: w.configure(highlightcolor=w.ring_hidden)  # noqa: E731
+        elif w.winfo_class() in ("TButton", "TCheckbutton"):
+            orig = str(w.cget("style"))
+            base = orig or w.winfo_class()
+            quiet = "Quiet." + base
+            st = ttk.Style(root)
+
+            def ensure():  # layouts belong to a theme: make the "quiet" one for the theme that is on now
+                key = (st.theme_use(), quiet)
+                if key not in quiet_done:
+                    st.layout(quiet, strip_focus(st.layout(base)))
+                    quiet_done.add(key)
+
+            try:
+                ensure()
+            except tk.TclError:
+                return
+
+            def hide():
+                ensure()
+                w.configure(style=quiet)
+            show = lambda: w.configure(style=orig)  # noqa: E731
+        else:
+            return
+        job = {"id": None}
+
+        def cancel():
+            if job["id"] is not None:
+                w.after_cancel(job["id"])
+                job["id"] = None
+
+        def on_in(_e):
+            cancel()
+            try:
+                show()
+            except tk.TclError:
+                return
+            if time.time() - kbd["tab"] > 0.4:
+                job["id"] = w.after(3000, fade)
+
+        def fade():
+            job["id"] = None
+            try:
+                if root.focus_get() is w:
+                    hide()
+            except (tk.TclError, KeyError):
+                pass
+
+        def on_out(_e):
+            cancel()
+            try:
+                show()
+            except tk.TclError:
+                pass
+
+        w.bind("<FocusIn>", on_in, "+")
+        w.bind("<FocusOut>", on_out, "+")
+
+    quiet_done = set()
+
+    def apply_calm(parent):
+        for child in parent.winfo_children():
+            calm_focus(child)
+            apply_calm(child)
+
+    apply_calm(root)
+
+    # ---- dark theme: the light look is the system theme untouched; dark = the "clam" theme with a palette, plus the plain tk widgets
+    DARK = dict(bg="#2b2d30", field="#1e1f22", fg="#dfe1e5", border="#4e5157", btn="#3c3f41", btn_hi="#4c5052", sel="#2f65ca",
+                dis="#7b7f87", link="#6ea8ff", tipbg="#3c3f41")
+    style0 = ttk.Style(root)
+    light_theme = style0.theme_use()
+    _t, _l = tk.Text(root), tk.Listbox(root)
+    LIGHT_TK = {"text": {o: _t.cget(o) for o in ("background", "foreground", "insertbackground", "selectbackground", "selectforeground")},
+                "list": {o: _l.cget(o) for o in ("background", "foreground", "selectbackground", "selectforeground")},
+                "top": root.cget("background")}
+    _t.destroy()
+    _l.destroy()
+    theme_state = {"dark": False}
+    dark_cb = {}  # check box pictures of the dark theme (made once)
+
+    # ---- title bars (Windows). Windows 11: the dark-mode attribute plus caption colours, for every window. Windows 10: only the dark-mode
+    # attribute, and only when "Show accent colour on title bars and window borders" is OFF: with it on, Windows paints the title bar of
+    # the ACTIVE window with the accent colour whatever a program asks for (a user's log showed ColorPrevalence=1 and the accent #E0E8ED:
+    # the "light active / dark inactive" mix). Then the program leaves the title bars to the system and says so in Setup.
+    title_seen = set()
+
+    def title_plan():
+        """-> 'none' (not Windows), 'win11', 'dark10' (Windows 10, accent off) or 'system' (Windows 10, accent on: hands off)."""
+        if sys.platform != "win32":
+            return "none"
+        build = getattr(sys.getwindowsversion(), "build", 0)
+        if build >= 22000:
+            return "win11"
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\DWM") as k:
+                if winreg.QueryValueEx(k, "ColorPrevalence")[0]:
+                    return "system"
+        except OSError:
+            pass
+        return "dark10"
+
+    def titlebar_now(win, on, plan):
+        try:
+            import ctypes
+            from ctypes import wintypes as wt
+            u, d = ctypes.windll.user32, ctypes.windll.dwmapi
+            u.GetAncestor.argtypes, u.GetAncestor.restype = [wt.HWND, wt.UINT], wt.HWND
+            u.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.UINT]
+            u.RedrawWindow.argtypes = [wt.HWND, ctypes.c_void_p, ctypes.c_void_p, wt.UINT]
+            d.DwmSetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD]
+            hwnd = u.GetAncestor(win.winfo_id(), 2)  # the top-level window itself (not an owner)
+            if not hwnd:
+                return
+
+            def put(attr, value, kind=ctypes.c_uint):
+                val = kind(value)
+                return d.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val))
+
+            r = put(20, 1 if on else 0, ctypes.c_int)
+            if r != 0:
+                r = put(19, 1 if on else 0, ctypes.c_int)  # older Windows 10
+            if plan == "win11":
+                put(35, 0x00221F1E if on else 0xFFFFFFFF)  # caption colour #1e1f22 (the colour of the input fields)
+                put(36, 0x00E5E1DF if on else 0xFFFFFFFF)  # title text colour #dfe1e5
+            u.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x27)  # frame changed
+            u.RedrawWindow(hwnd, None, None, 0x0001 | 0x0004 | 0x0400 | 0x0100)  # repaint the frame now
+            if (plan, on) not in title_seen:
+                title_seen.add((plan, on))
+                file_log("Title bar (%s, %s): dark mode %s" % (plan, "dark" if on else "light", "ok" if r == 0 else "refused (0x%X)" % (r & 0xFFFFFFFF)))
+        except Exception as e:  # noqa
+            if "err" not in title_seen:
+                title_seen.add("err")
+                file_log("Title bar: could not be changed (%r)" % (e,))
+
+    def dark_titlebar(win, on, delays=(0, 150)):
+        """Title bar of this window in the colours of the theme, where Windows allows it (see above)."""
+        plan = title_plan()
+        if plan == "none":
+            return
+        if plan == "system":
+            if "system" not in title_seen:
+                title_seen.add("system")
+                file_log("Title bar: Windows 10 with accent colour on title bars is on - title bars are left to the system")
+            return
+        try:
+            win.update_idletasks()
+        except tk.TclError:
+            return
+        for ms in delays:
+            try:
+                call = (lambda: titlebar_now(win, bool(on), plan))
+                win.after(ms, call) if ms else call()
+            except tk.TclError:
+                pass
+
+    def on_toplevel_map(e):
+        w = e.widget
+        try:
+            if w.winfo_class() == "Toplevel" and not w.overrideredirect():  # not the hover hints
+                dark_titlebar(w, theme_state["dark"], delays=(0, 150, 500))
+        except tk.TclError:
+            pass
+
+    def refresh_titlebars():
+        dark_titlebar(root, theme_state["dark"])
+        for t in root.winfo_children():  # open Setup / dialogs
+            if t.winfo_class() == "Toplevel" and not t.overrideredirect():
+                dark_titlebar(t, theme_state["dark"], delays=(0, 150, 500))
+
+    root.bind_class("Toplevel", "<Map>", on_toplevel_map, "+")
+    root.bind("<Map>", lambda e: dark_titlebar(root, theme_state["dark"]) if e.widget is root else None, "+")
+
+    def recolor(widget, tkc, lbc, topbg, ring_bg, ring_on):
+        for c in widget.winfo_children():
+            cls = c.winfo_class()
+            try:
+                if cls == "Text":
+                    c.configure(**tkc)
+                elif cls in ("Toplevel", "Canvas"):
+                    c.configure(background=topbg)
+                elif isinstance(c, StartButton):
+                    c.ring_hidden, c.ring_shown = ring_bg, ring_on
+                    c.configure(highlightbackground=ring_bg, highlightcolor=ring_bg)
+                elif cls == "TCombobox":
+                    pop = str(root.tk.eval("ttk::combobox::PopdownWindow %s" % c))
+                    root.tk.call(pop + ".f.l", "configure", *sum((("-" + k, val) for k, val in lbc.items()), ()))
+            except tk.TclError:
+                pass
+            recolor(c, tkc, lbc, topbg, ring_bg, ring_on)
+
+    def apply_theme(dark):
+        st = ttk.Style(root)
+        theme_state["dark"] = bool(dark)
+        if dark:
+            p = DARK
+            st.theme_use("clam")
+            st.configure(".", background=p["bg"], foreground=p["fg"], fieldbackground=p["field"], troughcolor=p["field"],
+                         bordercolor=p["border"], darkcolor=p["border"], lightcolor=p["border"], focuscolor=p["bg"],
+                         selectbackground=p["sel"], selectforeground="#ffffff", insertcolor=p["fg"])
+            st.map(".", foreground=[("disabled", p["dis"])])
+            st.configure("TButton", background=p["btn"], padding=(8, 3))
+            st.map("TButton", background=[("disabled", p["btn"]), ("pressed", p["btn_hi"]), ("active", p["btn_hi"])])
+            if not dark_cb:
+                px, gap = max(14, int(round(16 * scale))), max(4, int(round(5 * scale)))
+
+                def pic(checked, border, fill, mark="#ffffff"):
+                    rgb = lambda h: tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))  # noqa: E731
+                    return tk.PhotoImage(data=base64.b64encode(checkbox_png(px, checked, rgb(border), rgb(fill), rgb(mark), gap)))
+
+                dark_cb.update(off=pic(False, "#868b94", p["field"]), off_hot=pic(False, "#aab0ba", "#2a2c30"),
+                               off_dis=pic(False, "#4a4d52", p["bg"]), on=pic(True, "#3574d4", "#3574d4"),
+                               on_hot=pic(True, "#4a88ee", "#4a88ee"), on_dis=pic(True, "#44474c", "#44474c", "#8a8e96"))
+                st.element_create("Dark.indicator", "image", dark_cb["off"],
+                                  ("disabled", "selected", dark_cb["on_dis"]), ("disabled", dark_cb["off_dis"]),
+                                  ("selected", "active", dark_cb["on_hot"]), ("selected", dark_cb["on"]),
+                                  ("active", dark_cb["off_hot"]))
+            st.layout("TCheckbutton", [("Checkbutton.padding", {"sticky": "nswe", "children": [
+                ("Dark.indicator", {"side": "left", "sticky": ""}),
+                ("Checkbutton.focus", {"side": "left", "sticky": "w", "children": [("Checkbutton.label", {"sticky": "nswe"})]})]})])
+            st.configure("TCheckbutton", background=p["bg"])
+            st.map("TCheckbutton", background=[("active", p["bg"])])
+            for name in ("TEntry", "TCombobox", "TSpinbox"):
+                st.configure(name, fieldbackground=p["field"], foreground=p["fg"], insertcolor=p["fg"], bordercolor=p["border"],
+                             arrowcolor=p["fg"], background=p["btn"])
+                st.map(name, fieldbackground=[("disabled", p["bg"]), ("readonly", p["field"])],
+                       foreground=[("disabled", p["dis"])], background=[("active", p["btn_hi"])],
+                       selectbackground=[("!focus", p["field"])], selectforeground=[("!focus", p["fg"])])
+            st.configure("TNotebook", background=p["bg"], bordercolor=p["border"])
+            st.configure("TNotebook.Tab", background=p["btn"], foreground=p["fg"], padding=(10, 3), bordercolor=p["border"])
+            st.map("TNotebook.Tab", background=[("selected", p["bg"]), ("active", p["btn_hi"])])
+            st.configure("TScrollbar", background=p["btn"], troughcolor=p["field"], bordercolor=p["border"], arrowcolor=p["fg"],
+                         darkcolor=p["btn"], lightcolor=p["btn"])
+            st.map("TScrollbar", background=[("active", p["btn_hi"])])
+            st.configure("TPanedwindow", background=p["bg"])
+            tkc = dict(background=p["field"], foreground=p["fg"], insertbackground=p["fg"], selectbackground=p["sel"], selectforeground="#ffffff")
+            lbc = dict(background=p["field"], foreground=p["fg"], selectbackground=p["sel"], selectforeground="#ffffff")
+            topbg, ring_on = p["bg"], "#8ab4f8"
+            TIP_COLORS.update(bg=p["tipbg"], fg=p["fg"])
+            upd_lbl.configure(foreground=p["link"])
+        else:
+            st.theme_use(light_theme)
+            tkc, lbc, topbg, ring_on = LIGHT_TK["text"], LIGHT_TK["list"], LIGHT_TK["top"], "#163f7a"
+            TIP_COLORS.update(bg="#ffffe0", fg="#000000")
+            upd_lbl.configure(foreground="#0b57d0")
+        for opt, val in tkc.items():
+            root.option_add("*Text." + opt, val)
+        for opt, val in lbc.items():
+            root.option_add("*TCombobox*Listbox." + opt, val)
+            root.option_add("*Listbox." + opt, val)
+        root.option_add("*Toplevel.background", topbg)
+        root.option_add("*Canvas.background", topbg)
+        root.configure(background=topbg)
+        ring_bg = ttk.Style(root).lookup("TFrame", "background") or topbg
+        recolor(root, tkc, lbc, topbg, ring_bg, ring_on)
+        mode = "dark" if dark else "light"
+        icon_mode["cur"] = mode
+        setup_btn.configure(image=GEARS[mode])
+        refresh_link()
+        refresh_titlebars()
+        align_later()
+
+    # ---- update check: which release is the newest on GitHub (the program only tells; nothing is downloaded or installed)
+    upd = {"found": "", "url": "", "busy": False, "last": 0.0}
+    try:
+        upd["last"] = float(saved.get("UPDATE_LAST") or 0)
+    except (TypeError, ValueError):
+        pass
+    upd_status = tk.StringVar(value="")
+
+    def show_update(tag, url):
+        upd["found"], upd["url"] = str(tag or ""), str(url or "")
+        if tag and parse_version(tag) > parse_version(VERSION):
+            upd_lbl.configure(text="Update " + str(tag).lstrip("vV"))
+            if not upd_lbl.winfo_manager():
+                upd_lbl.pack(side="right", padx=(0, 10), before=cb_signin)
+        else:
+            upd_lbl.pack_forget()
+
+    def open_update(_e=None):
+        url = upd["url"]
+        if url.startswith("https://github.com/%s/" % UPDATE_REPO):
+            webbrowser.open(url)
+        return "break"
+
+    upd_lbl.bind("<Button-1>", open_update)
+    for key in ("<space>", "<Return>"):
+        upd_lbl.bind(key, open_update)
+    upd_lbl.bind("<FocusIn>", lambda _e: upd_lbl.configure(relief="solid"), "+")
+    upd_lbl.bind("<FocusOut>", lambda _e: upd_lbl.configure(relief="flat"), "+")
+
+    def check_updates(report=None):
+        if upd["busy"]:
+            return
+        upd["busy"] = True
+
+        def work():
+            try:
+                tag, url = latest_release(UPDATE_REPO)
+                err = ""
+            except Exception as e:  # noqa
+                tag, url, err = "", "", str(e) or e.__class__.__name__
+
+            def done():
+                upd["busy"] = False
+                if tag:
+                    upd["last"] = time.time()
+                    show_update(tag, url)
+                    if parse_version(tag) > parse_version(VERSION):
+                        log("A new version of the Grabber is available: %s - %s" % (tag, url))
+                else:
+                    file_log("Update check failed: %s" % err)
+                if report:
+                    report(tag, err)
+            auth_q.put(done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def auto_update_check():
+        if b["CHECK_UPDATES"].get() and time.time() - upd["last"] > 12 * 3600:
+            check_updates()
+
     # ---- undo for entry fields, context menus, hover hints
-    for ent, key in ((e_token, "TOKEN"), (path_combo, "PATH"), (e_img, "IMGFOLDER"), (e_prefix, "PREFIX"),
-                     (e_dscr, "DSCR"), (e_pics, "PICS"), (e_gal, "GALLERY")):
+    for ent, key in ((path_combo, "PATH"), (e_prefix, "PREFIX"),
+                     (e_pics, "PICS"), (e_gal, "GALLERY")):
         UndoEntry(ent, v[key])
         attach_menu(ent)
     attach_menu(urlbox)
     attach_menu(box, editable=False)
 
     for widget, text in (
-            (e_token, "Your Civitai API key (account settings, API keys). Saved in civitai_grabber_settings.json next to the script."),
-            (lock_btn, "Lock the token field against accidental edits / unlock it to change the token."),
-            (signin_btn, "Sign in with your Civitai account instead of pasting an API token. While you are signed in the "
-                         "API token is not used (the log says which credentials every run used). Needs a free local port 8765."),
+            (upd_lbl, lambda: "Version %s is available (this is %s). Click to open its download page. The program installs nothing by itself." % (str(upd["found"]).lstrip("vV"), VERSION)),
+            (cb_signin, lambda: signin_tip()),
+            (cb_api, lambda: api_tip()),
             (path_combo, "Category folder: the place for one kind of models (characters, styles, poses ...). "
                          "Every model gets its own subfolder here, named after the model. "
-                         "The drop-down list holds the 12 most recently used folders; its first line, \"Add output folder...\", "
+                         "The drop-down list holds the most recently used folders (the number is set in Setup, 12 by default); its first line, \"Add output folder...\", "
                          "opens the folder chooser."),
             (cb_model, "Download the model file (LoRA, checkpoint ...). Untick to get only examples/gallery images and the description file."),
             (lbl_prefix, "Prefix: text put in front of the model file name (used only when Model file is ticked). "
                          "Handy for sorting models in a stack."),
             (e_gal, "How many images other users uploaded to the model's gallery to download: a number, all (can be thousands!), "
                     "or 0/empty for none. Needs the browser bridge, so this box is greyed out without it."),
-            (cb_sub, "Save single image links into the subfolder below. Only for a run that has NO model link before "
-                     "the image links; images that follow a model link always go into that model's folder."),
-            (cb_dname, "Name the description file after the model. Its extension (.txt / .md) is taken from the "
-                       "Description file box; images saved without a model still use the name in that box."),
-            (e_img, "Subfolder name or nested path (a/b/c) inside the category folder; a full path such as "
-                    "d:\\AI\\pics = exactly that folder. Paste it, no Browse needed. The list holds recent entries."),
             (e_prefix, "Text added to the start of the model file name, e.g. k2-pers-. Handy for sorting and grouping models "
-                       "in file lists and in the model stacks of generation programs. The list holds the 12 most recent prefixes."),
-            (e_dscr, "Name of the description file written next to the model (.txt or .md; no extension = .txt). "
-                     "Markdown is used for .md. EMPTY = no description file is written."),
+                       "in file lists and in the model stacks of generation programs. The list holds the most recent prefixes (as many as folders; set in Setup)."),
             (e_pics, "How many example images/videos the model's author attached to the version: a number, all, or 0/empty for none."),
-            (cb_video, "Also download video examples. They count towards the number of examples."),
             (link_btn, "Link the prefix to the output folder. Rings joined: linked - the prefix is filled in whenever this folder is chosen; "
                        "click to unlink. Rings apart: not linked, or the prefix was changed - click to link the prefix typed now to this folder. "
                        "Editing the prefix is never blocked."),
-            (cb_rename, "A model file whose name is only an ID (26 random characters, e.g. from the Civitai trainer) is saved under the model "
-                        "title (with the version name when the model has several versions). The original name is written to the description file."),
-            (cb_orig, "Try to read the original file name from the image page. Pages are often blocked for scripts "
-                      "(HTTP 403); then the name from the image address is used."),
-            (cb_webp, "Convert downloaded WebP images to JPG (quality 95). Needs Pillow: py -m pip install pillow"),
             (urlbox, "Model links (…/models/ID) and single image links (…/images/ID), one per line. "
                      "Finished links disappear from the list; failed ones stay."),
             (undo_btn, "Undo the last change in the box you were working in (the link list by default). Ctrl+Z does the same."),
@@ -3514,7 +4304,8 @@ def main_gui():
             (stop_btn, "Stop after the current step."),
             (copylog_btn, "Copy the whole log to the clipboard."),
             (openlog_btn, "Open civitai_grabber.log in the default editor."),
-            (cb_bridge, "Local port 127.0.0.1 for the browser extension, which fetches image pages with your logged-in browser."),
+            (cb_bridge, lambda: "Local port 127.0.0.1 for the browser extension, which fetches image pages with your logged-in browser.\nNow: %s." % bridge_status()),
+            (setup_btn, "Setup: rarely changed options."),
             (help_btn, "Short help.")):
         Tooltip(widget, text)
 
@@ -3538,7 +4329,7 @@ def main_gui():
     def refresh_link(*_):  # only the picture changes: joined rings = linked; apart (paler) = not linked or the prefix was changed
         st = link_state()
         link_btn.state(["disabled"] if st == "off" else ["!disabled"])
-        link_btn.configure(image=icon_on if st == "linked" else icon_off, cursor="arrow" if st == "off" else "hand2")
+        link_btn.configure(image=ICONS[icon_mode["cur"]]["on" if st == "linked" else "off"], cursor="arrow" if st == "off" else "hand2")
 
     def toggle_link():
         key = norm_path(v["PATH"].get())
@@ -3573,19 +4364,43 @@ def main_gui():
         refresh_link()
 
     link_btn.bind("<Button-1>", lambda _e: toggle_link() if link_state() != "off" else None)
+    link_btn.bind("<FocusIn>", lambda _e: link_btn.configure(relief="solid"), "+")
+    link_btn.bind("<FocusOut>", lambda _e: link_btn.configure(relief="flat"), "+")
+    for key in ("<space>", "<Return>"):
+        link_btn.bind(key, lambda _e: (toggle_link() if link_state() != "off" else None, "break")[1])
 
     # ---- logic
-    def set_lock(lock):
-        e_token.configure(state="readonly" if lock else "normal")
-        lock_btn.configure(text="Unlock" if lock else "Lock")
+    lock_state = {"locked": False}
+
+    def set_lock(lock):  # the token field (in Setup) is locked against accidental edits
+        lock_state["locked"] = bool(lock)
+        try:
+            if "e_token" in setup_w:
+                setup_w["e_token"].configure(state="readonly" if lock else "normal", show="\u2022" if lock else "")  # unlocked: the key is visible
+                setup_w["lock_btn"].configure(text="Unlock" if lock else "Lock")
+        except tk.TclError:
+            pass
+
+    def active_token():  # the API token counts only while "Connect via API" is ticked
+        return v["TOKEN"].get().strip() if b["USE_API"].get() else ""
+
+    def signin_tip():
+        si = AUTH.signed_in()
+        t = ("Sign in with your Civitai account (a browser window opens); untick to sign out. "
+             "This connection has priority over the API token. Needs a free local port 8765.")
+        return t + ("\nSigned in as %s." % ", ".join((u or "?") for u in si.values())) if si else t
+
+    def api_tip():
+        t = "Use your Civitai API key (Setup, tab Connection) when you are not signed in."
+        return t if v["TOKEN"].get().strip() else t + "\nNo token entered yet."
 
     def refresh_signin_ui():
-        si = AUTH.signed_in()
-        if si:
-            who = ", ".join((u or "?") for u in si.values())
-            signin_btn.configure(state="normal", text=("Sign out: %s" % who)[:30])
-        else:
-            signin_btn.configure(state="normal", text="Sign in with Civitai")
+        signin_var.set(bool(AUTH.signed_in()))
+        cb_signin.configure(state="normal", text="Connect via Sign-in")
+
+    def on_signin_click():
+        signin_var.set(bool(AUTH.signed_in()))  # the box shows the real state; it changes when the sign-in or sign-out really happens
+        do_signin()
 
     def ask_site():
         """Small modal window: which Civitai site to sign in to. Returns 'civitai.red', 'civitai.com' or None."""
@@ -3608,7 +4423,7 @@ def main_gui():
 
     def do_signin():
         if AUTH.signed_in():
-            if messagebox.askyesno("Civitai Grabber", "Sign out?\n\nThe program will use the API token again "
+            if messagebox.askyesno("Civitai Grabber", "Sign out?\n\nThe program will use the API token again (if \"Connect via API\" is ticked) "
                                    "(you can also revoke the access in your Civitai account: Connected Apps)."):
                 AUTH.sign_out()
                 refresh_signin_ui()
@@ -3617,7 +4432,7 @@ def main_gui():
         site = ask_site()
         if not site:
             return
-        signin_btn.configure(state="disabled", text="Waiting for the browser ...")
+        cb_signin.configure(state="disabled", text="Waiting for the browser ...")
 
         def work():
             try:
@@ -3640,7 +4455,12 @@ def main_gui():
         lst[:] = [x for x in lst if os.path.normcase(x) != os.path.normcase(value)]
         lst.insert(0, value)
         del lst[RECENT_LIMIT.get(key, 10):]
-        combos[key].configure(values=([BROWSE_LABEL] + lst) if key == "PATH" else lst)
+        w = combos.get(key)
+        if w is not None:  # the image subfolder box lives in Setup and exists only while it is open
+            try:
+                w.configure(values=([BROWSE_LABEL] + lst) if key == "PATH" else lst)
+            except tk.TclError:
+                pass
 
     def set_values(d):
         """Apply a (partial) settings dict to the window."""
@@ -3653,12 +4473,15 @@ def main_gui():
         if "EXISTING" in d:
             ex = str(d["EXISTING"]).lower()
             existing_var.set(next((lbl for lbl, code in EXISTING_LABELS if code == ex), "Ask"))
+        if d.get("TOKEN") and "USE_API" not in d:
+            b["USE_API"].set(True)  # a task file with a token: the token is meant to be used
         set_lock(bool(v["TOKEN"].get().strip()))
 
     def collect_cfg():
         cfg = {k: v[k].get().strip() for k in TEXT_KEYS}
         for k in FLAG_KEYS:
             cfg[k] = "1" if b[k].get() else "0"
+        cfg["TOKEN"] = active_token()
         cfg["EXISTING"] = next((code for lbl, code in EXISTING_LABELS if lbl == existing_var.get()), "ask")
         return cfg
 
@@ -3839,6 +4662,202 @@ def main_gui():
         if not open_path(LOGFILE):
             log("Cannot open the log file.")
 
+    # ---- Setup window: rarely changed options (changes apply at once and are saved); more sections will join later
+    setup_state = {"win": None}
+    existing_var.trace_add("write", lambda *_: save_settings())
+    b["COMFY"].trace_add("write", lambda *_: save_settings())
+
+    def open_setup(tab=None):
+        if setup_state["win"] is not None:
+            try:
+                setup_state["win"].deiconify()
+                setup_state["win"].lift()
+                setup_state["win"].focus_set()
+                if tab in setup_state.get("tabs", {}):
+                    setup_state["nb"].select(setup_state["tabs"][tab])
+                return
+            except tk.TclError:
+                setup_state["win"] = None
+        win = tk.Toplevel(root)
+        setup_state["win"] = win
+        win.title("Civitai Grabber - Setup")
+        win.transient(root)
+        try:
+            if app_icon:
+                win.iconphoto(False, app_icon)
+        except tk.TclError:
+            pass
+        nb = ttk.Notebook(win)
+        nb.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+        dl = ttk.Frame(nb, padding=12)
+        nb.add(dl, text="Downloads")
+        con = ttk.Frame(nb, padding=12)
+        nb.add(con, text="Connection")
+        gen = ttk.Frame(nb, padding=12)
+        nb.add(gen, text="Program")
+        setup_state["nb"], setup_state["tabs"] = nb, {"Downloads": dl, "Connection": con, "Program": gen}
+        if tab in setup_state["tabs"]:
+            nb.select(setup_state["tabs"][tab])
+        dl.columnconfigure(1, weight=1)
+        tips = []
+
+        ttk.Label(dl, text="If already downloaded:").grid(row=0, column=0, sticky="w", pady=4)
+        cmb_ex = ttk.Combobox(dl, textvariable=existing_var, values=[lbl for lbl, _c in EXISTING_LABELS], state="readonly", width=16)
+        cmb_ex.grid(row=0, column=1, sticky="w", padx=(10, 0), pady=4)
+        tips.append((cmb_ex, "What to do with a model or image that was downloaded before. Ask: a window asks every time (default). "
+                             "Skip: it is passed by. Download again: it is downloaded again and overwritten."))
+
+        ttk.Label(dl, text="Description file:").grid(row=1, column=0, sticky="w", pady=4)
+        row_d = ttk.Frame(dl)
+        row_d.grid(row=1, column=1, sticky="we", padx=(10, 0), pady=4)
+        e_dscr = ttk.Entry(row_d, textvariable=v["DSCR"], width=16)
+        e_dscr.pack(side="left", fill="x", expand=True, ipady=2)
+        cb_dname = ttk.Checkbutton(row_d, text="Name as model", variable=b["DSCR_AS_MODEL"])
+        cb_dname.pack(side="left", padx=(10, 0))
+
+        cb_sub = ttk.Checkbutton(dl, text="Image subfolder:", variable=b["USE_SUBFOLDER"])
+        cb_sub.grid(row=2, column=0, sticky="w", pady=4)
+        e_img = ttk.Combobox(dl, textvariable=v["IMGFOLDER"], width=30, values=recent["IMGFOLDER"])
+        e_img.grid(row=2, column=1, sticky="we", padx=(10, 0), pady=4, ipady=2)
+        combos["IMGFOLDER"] = e_img
+        for ent, key in ((e_dscr, "DSCR"), (e_img, "IMGFOLDER")):
+            UndoEntry(ent, v[key])
+            attach_menu(ent)
+        setup_w.update(e_dscr=e_dscr, e_img=e_img)
+
+        cb_video = ttk.Checkbutton(dl, text="Include videos", variable=b["VIDEO"])
+        cb_orig = ttk.Checkbutton(dl, text="Original file names", variable=b["ORIGINAL"])
+        cb_webp = ttk.Checkbutton(dl, text="Convert WebP to JPG", variable=b["WEBP2JPG"], command=on_webp)
+        cb_rename = ttk.Checkbutton(dl, text="Name ID-like model files by title", variable=b["RENAME_ID"])
+        cb_comfy = ttk.Checkbutton(dl, text="Save ComfyUI workflow as .json (experimental)", variable=b["COMFY"])
+        for r, w in enumerate((cb_video, cb_orig, cb_webp, cb_rename, cb_comfy), start=3):
+            w.grid(row=r, column=0, columnspan=2, sticky="w", pady=(8 if r == 3 else 3, 3))
+        tips.append((cb_comfy, "Experimental: if the image metadata holds a ComfyUI workflow, it is saved as a .json next to the image."))
+
+        ttk.Label(con, text="API token:").grid(row=0, column=0, sticky="w", pady=4)
+        e_token = ttk.Entry(con, textvariable=v["TOKEN"], show=("\u2022" if lock_state["locked"] else ""), width=38)
+        e_token.grid(row=0, column=1, sticky="w", padx=(10, 0), pady=4, ipady=2)
+        lock_btn = ttk.Button(con, text="Unlock" if lock_state["locked"] else "Lock", width=9)
+        lock_btn.grid(row=0, column=2, padx=(6, 0), pady=4)
+        ttk.Label(con, wraplength=520, justify="left",
+                  text="Your Civitai API key (account settings, API keys). It is used when \"Connect via API\" is ticked in the main "
+                       "window and you are not signed in. It is saved in civitai_grabber_settings.json next to the script, in plain "
+                       "text - do not share that file.").grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        UndoEntry(e_token, v["TOKEN"])
+        attach_menu(e_token)
+        e_token.configure(state="readonly" if lock_state["locked"] else "normal")
+        setup_w.update(e_token=e_token, lock_btn=lock_btn)
+        lock_btn.configure(command=lambda: set_lock(str(e_token.cget("state")) != "readonly"))
+        tips.append((e_token, "Your Civitai API key (account settings, API keys). Saved in civitai_grabber_settings.json next to the script."))
+        tips.append((lock_btn, "Lock the token field against accidental edits / unlock it to change the token."))
+
+        ttk.Label(gen, text="Folder and prefix history:").grid(row=0, column=0, sticky="w", pady=4)
+        lim_var = tk.StringVar(value=str(RECENT_LIMIT["PATH"]))
+        spn = ttk.Spinbox(gen, from_=5, to=30, width=6, textvariable=lim_var)
+        spn.grid(row=0, column=1, sticky="w", padx=(10, 0), pady=4)
+        tips.append((spn, "How many recently used output folders and prefixes the two drop-down lists keep (5 to 30). "
+                          "Lowering the number cuts the oldest entries from the lists."))
+
+        def apply_limit(*_):
+            try:
+                n = int(lim_var.get())
+            except ValueError:
+                return
+            if not 5 <= n <= 30:
+                return  # not applied while a wrong number is typed
+            RECENT_LIMIT["PATH"] = RECENT_LIMIT["PREFIX"] = n
+            del recent["PATH"][n:]
+            del recent["PREFIX"][n:]
+            path_combo.configure(values=[BROWSE_LABEL] + recent["PATH"], height=n + 1)
+            e_prefix.configure(values=recent["PREFIX"], height=n)
+            save_settings()
+
+        lim_var.trace_add("write", apply_limit)
+        cb_dark = ttk.Checkbutton(gen, text="Dark theme", variable=b["DARK"],
+                                  command=lambda: (apply_theme(bool(b["DARK"].get())), save_settings()))
+        cb_dark.grid(row=1, column=0, columnspan=2, sticky="w", pady=(12, 4))
+        row_u = ttk.Frame(gen)
+        row_u.grid(row=2, column=0, columnspan=2, sticky="we", pady=4)
+        cb_upd = ttk.Checkbutton(row_u, text="Check for updates on start", variable=b["CHECK_UPDATES"])
+        cb_upd.pack(side="left")
+
+        def report(tag, err):
+            if not tag:
+                upd_status.set("Could not check (no connection?)")
+            elif parse_version(tag) > parse_version(VERSION):
+                upd_status.set("New version available: %s" % str(tag).lstrip("vV"))
+            else:
+                upd_status.set("This is the latest version (%s)" % VERSION)
+
+        def check_now():
+            upd_status.set("Checking ...")
+            check_updates(report)
+
+        btn_upd = ttk.Button(row_u, text="Check now", command=check_now)
+        btn_upd.pack(side="left", padx=(14, 0))
+        ttk.Label(row_u, textvariable=upd_status).pack(side="left", padx=(10, 0))
+        if title_plan() == "system":  # Windows 10 paints active title bars with the accent colour: say so, offer the setting
+            row_h = ttk.Frame(gen)
+            row_h.grid(row=3, column=0, columnspan=2, sticky="we", pady=(14, 2))
+            ttk.Label(row_h, wraplength=520, justify="left",
+                      text="Windows 10 paints the title bar of the active window with the accent colour (Windows Settings > Personalization "
+                           "> Colors > \"Title bars and window borders\"), so title bars stay light with the dark theme. Turn that "
+                           "setting off to get dark title bars.").pack(anchor="w")
+
+            def open_colors():
+                try:
+                    os.startfile("ms-settings:colors")
+                except OSError:
+                    pass
+            ttk.Button(row_h, text="Open Windows color settings", command=open_colors).pack(anchor="w", pady=(6, 0))
+        tips.append((cb_dark, "Dark colours for the whole program. Windows system message boxes stay light."))
+        tips.append((cb_upd, "At start (not more than once in 12 hours) the program asks github.com which release is the newest "
+                             "and shows a link at the top if it is newer than this one. Nothing is downloaded or installed by itself."))
+        for widget, text in tips:
+            Tooltip(widget, text)
+        for widget, text in (
+            (cb_sub, "Save single image links into the subfolder below. Only for a run that has NO model link before "
+                     "the image links; images that follow a model link always go into that model's folder."),
+            (cb_dname, "Name the description file after the model. Its extension (.txt / .md) is taken from the "
+                       "Description file box; images saved without a model still use the name in that box."),
+            (e_img, "Subfolder name or nested path (a/b/c) inside the category folder; a full path such as "
+                    "d:\\AI\\pics = exactly that folder. Paste it, no Browse needed. The list holds recent entries."),
+            (e_dscr, "Name of the description file written next to the model (.txt or .md; no extension = .txt). "
+                     "Markdown is used for .md. EMPTY = no description file is written."),
+            (cb_video, "Also download video examples. They count towards the number of examples."),
+            (cb_rename, "A model file whose name is only an ID (26 random characters, e.g. from the Civitai trainer) is saved under the model "
+                        "title (with the version name when the model has several versions). The original name is written to the description file."),
+            (cb_orig, "Try to read the original file name from the image page. Pages are often blocked for scripts "
+                      "(HTTP 403); then the name from the image address is used."),
+            (cb_webp, "Convert downloaded WebP images to JPG (quality 95). Needs Pillow: py -m pip install pillow"),
+        ):
+            Tooltip(widget, text)
+        sync_setup()
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=10, pady=10)
+
+        def close(_e=None):
+            setup_state["win"] = None
+            setup_w.clear()
+            setup_state.pop("tabs", None)
+            combos.pop("IMGFOLDER", None)
+            win.destroy()
+
+        ttk.Button(bar, text="Close", command=close).pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.bind("<Escape>", close)
+        apply_calm(win)
+        win.update_idletasks()
+        w0, h0 = win.winfo_reqwidth(), win.winfo_reqheight()
+        win.minsize(w0, h0)
+        win.maxsize(int(w0 * 1.6), 4000)
+        win.resizable(True, False)  # widened a bit if wanted; the height always follows the content
+        x = root.winfo_rootx() + max(0, (root.winfo_width() - w0) // 2)
+        y = root.winfo_rooty() + max(0, (root.winfo_height() - h0) // 3)
+        win.geometry("+%d+%d" % (x, y))
+        win.focus_set()
+
     def show_help():
         win = tk.Toplevel(root)
         win.title("Civitai Grabber - help")
@@ -3848,7 +4867,7 @@ def main_gui():
         bar = ttk.Frame(win, padding=6)
         bar.pack(side="bottom", fill="x")
         status = ttk.Label(bar, text="")
-        txt = scrolledtext.ScrolledText(win, wrap="word", font=mono)
+        txt = ScrollText(win, wrap="word", font=mono)
         txt.pack(fill="both", expand=True)
         txt.insert("1.0", HELP_TEXT % VERSION)
         txt.configure(state="disabled")
@@ -4167,7 +5186,7 @@ def main_gui():
             title = (res.get("name") or "Model") + ((" - " + res["ver"]) if res.get("ver") else "")
             items.append((u, title, res.get("text") or "This link cannot be downloaded."))
         kind = rows[0][1].get("kind") if len(rows) == 1 else ""
-        gone = list(ask_remove_links(items, ("Exclude link", "Download anyway") if kind == "folder" else ("Remove link", "Keep link")))
+        gone = list(ask_remove_links(items, ("Exclude link", "Download to new folder") if kind == "folder" else ("Remove link", "Keep link")))
         links = current_links()
         for u in list(gone):
             below = [x for x in images_below(u, links) if x not in gone]
@@ -4230,7 +5249,7 @@ def main_gui():
             c_ev.set()
         except queue.Empty:
             pass
-        rows = checker.tick(current_links(), v["TOKEN"].get().strip(), collect_cfg)
+        rows = checker.tick(current_links(), active_token(), collect_cfg)
         if rows:
             handle_problems(rows)
         t = state["thread"]
@@ -4257,7 +5276,9 @@ def main_gui():
                         start()
                     finally:
                         start_ctx["force"] = False
-        bridge_lbl.configure(text=bridge_status())
+        bt = "Browser bridge: ports busy" if bridge_status().startswith("could not") else "Browser bridge"
+        if str(cb_bridge.cget("text")) != bt:  # a failure to start is the only status the box shows itself
+            cb_bridge.configure(text=bt)
         tb_tick()
         if (not launch_state["asked"] and BRIDGE.connected() and sys.platform.startswith("win")
                 and not launcher_registered()):
@@ -4326,11 +5347,14 @@ def main_gui():
     def save_settings():
         try:
             d = collect_cfg()
+            d["TOKEN"] = v["TOKEN"].get().strip()  # the saved token stays even while "Connect via API" is off
+            d["UPDATE_LAST"], d["UPDATE_FOUND"], d["UPDATE_URL"] = upd["last"], upd["found"], upd["url"]
             d["URLS"] = urlbox.get("1.0", "end").strip()
             d["LAUNCH_ASKED"] = launch_state["asked"]
             d["RECENT"] = list(recent["PATH"])
             d["RECENT_PREFIX"] = list(recent["PREFIX"])
             d["RECENT_SUB"] = list(recent["IMGFOLDER"])
+            d["RECENT_PATHS_LIMIT"] = RECENT_LIMIT["PATH"]
             d["PREFIX_BY_PATH"] = dict(prefix_map)
             d["WINDOW"] = window_state()
             with open(SETTINGS, "w", encoding="utf-8") as f:
@@ -4393,9 +5417,14 @@ def main_gui():
         stop.set()
         log("Stopping after the current step…")
 
-    lock_btn.configure(command=lambda: set_lock(str(e_token.cget("state")) != "readonly"))
-    signin_btn.configure(command=do_signin)
+    cb_signin.configure(command=on_signin_click)
     refresh_signin_ui()
+
+    def on_api():
+        if b["USE_API"].get() and not v["TOKEN"].get().strip():
+            open_setup("Connection")  # nothing to use yet: show where the key goes
+
+    cb_api.configure(command=on_api)
     sample_btn.configure(command=create_sample)
     load_btn.configure(command=load_txt)
     start_btn.configure(command=start)
@@ -4407,16 +5436,19 @@ def main_gui():
     redo_btn.configure(command=do_redo)
     clear_btn.configure(command=clear_urls)
     help_btn.configure(command=show_help)
+    setup_btn.configure(command=open_setup)
     cb_bridge.configure(command=set_bridge)
-    cb_webp.configure(command=on_webp)
 
     # ---- restore previous settings
     for key, skey in (("PATH", "RECENT"), ("PREFIX", "RECENT_PREFIX"), ("IMGFOLDER", "RECENT_SUB")):
         for item in reversed(saved.get(skey) or []):
             push_recent(key, item)
     set_values({**DEFAULTS, **{k: x for k, x in saved.items() if k in DEFAULTS}})
-    existing_var.set("Ask")  # the "If already downloaded" box is hidden for now: always ask
     sync_fields()
+    show_update(saved.get("UPDATE_FOUND"), saved.get("UPDATE_URL"))  # a known newer version is shown at once, without waiting for the network
+    if b["DARK"].get():
+        apply_theme(True)
+    root.after(4000, auto_update_check)
     urlbox.insert("1.0", saved.get("URLS", ""))
     urlbox.edit_reset()
     if isinstance(saved.get("PREFIX_BY_PATH"), dict):
