@@ -164,7 +164,7 @@ and the signed `.xpi` 0.17.0 (the same code; only the Firefox manifest differs).
 - **Firefox 140 or newer (desktop), recommended:** install it from the Firefox Add-ons site:
   [Civitai Grabber Bridge](https://addons.mozilla.org/en-US/firefox/addon/civitai-grabber-bridge/) -> *Add to Firefox*.
   Firefox then updates it by itself.
-- **Firefox, the other way** (also Firefox for Android 142 or newer): open the latest Release and click the signed `.xpi`
+- **Firefox, the other way**: open the latest Release and click the signed `.xpi`
   file in the Assets list; Firefox asks whether to install it - confirm with *Add*. It is signed by Mozilla, so it stays
   installed after Firefox is restarted, and Firefox updates it by itself (it checks once a day, or use `about:addons` -> gear
   icon -> *Check for Updates*). Please install it this way: an add-on installed through *Install Add-on From File* did not
