@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Civitai Grabber v0.47 - batch downloader for Civitai LoRA models and their example
+Civitai Grabber v0.51 - batch downloader for Civitai LoRA models and their example
 images/videos with generation metadata. Python 3.8+, standard library only
 (Tkinter is included in the Windows installer from python.org).
 
-Run with a window:   python civitai_grabber.pyw
-Run without window:  python civitai_grabber.pyw task.txt
+Run with a window:   python civitai_grabber_v0.51.pyw
+Run without window:  python civitai_grabber_v0.51.pyw task.txt
 
 Settings can be entered in the window or given in a txt task file:
     TOKEN: your_api_token
@@ -61,7 +61,7 @@ import secrets
 import webbrowser
 from html.parser import HTMLParser
 
-VERSION = "0.47"
+VERSION = "0.51"
 
 # ======================================================================================================
 # SWITCHES - change True/False here, nothing else needs editing
@@ -91,7 +91,8 @@ STATE = {"log": None, "bridge_failures": 0, "bridge_off": False, "stop": None, "
 
 DEFAULTS = {"BRIDGE": "1", "TOKEN": "", "PATH": "", "PREFIX": "", "PICS": "4", "VIDEO": "1", "ORIGINAL": "1",
             "COMFY": "0", "EXISTING": "ask", "IMGFOLDER": "", "USE_SUBFOLDER": "0", "DSCR": "dscr.txt", "DSCR_AS_MODEL": "0", "MODEL": "1", "GALLERY": "0",
-            "WEBP2JPG": "0", "RENAME_ID": "0", "USE_API": "0", "DARK": "0", "CHECK_UPDATES": "1"}
+            "WEBP2JPG": "0", "RENAME_ID": "0", "USE_API": "0", "DARK": "0", "CHECK_UPDATES": "1", "COL_PICS": "1", "COL_GALLERY": "1",
+            "ON_PARTIAL": "ask", "PARTIAL_NOTICE": "each"}
 
 
 SECRETS = set()  # strings (the API token) that must never appear in a log
@@ -1761,6 +1762,7 @@ class LinkChecker:
         self.notify = notify or (lambda *a: None)
         self.state = {}       # link -> queued / ok / problem / kept
         self.kinds = {}       # link -> kind of the problem it was given
+        self.titles = {}      # link -> "Model name - version" (shown in the table)
         self.seen = {}        # link -> when it appeared
         self.problems = []    # [(link, result)] waiting for the dialog
         self.last_problem = 0.0
@@ -1782,7 +1784,7 @@ class LinkChecker:
         """Call often from the window thread. Returns a batch [(link, result)] to show in the dialog, or None."""
         now = time.time() if now is None else now
         live = set(links)
-        for d in (self.state, self.seen, self.kinds):
+        for d in (self.state, self.seen, self.kinds, self.titles):
             for u in [u for u in d if u not in live]:
                 del d[u]
         self.problems = [(u, r) for (u, r) in self.problems if u in live]
@@ -1808,6 +1810,8 @@ class LinkChecker:
                 continue  # the link left the list meanwhile
             kind = res.get("kind")
             label = (res.get("name") or "model") + ((" (version: %s)" % res["ver"]) if res.get("ver") else "")
+            if res.get("name"):
+                self.titles[u] = res["name"] + ((" - " + res["ver"]) if res.get("ver") else "")
             if kind == "error":
                 self.state[u] = "ok"
                 self.log("Link check: could not check %s - %s. The link stays in the list." % (label, res.get("text")))
@@ -3060,9 +3064,12 @@ def process_image(url, cfg, log, stop, ask):
     if not mm:
         raise ValueError("image id not found in the URL")
     iid = mm.group(1)
-    if STATE["model_folder"]:  # scenario 1: images that follow a model link go to that model's folder
+    own = cfg.get("OWN_FOLDER") == "1"  # the image was given a folder of its own: it does not follow the model above it
+    if cfg.get("DIR"):  # an image that waited on hold: the folder of its (already finished) model was kept
+        folder = os.path.normpath(cfg["DIR"])
+    elif STATE["model_folder"] and not own:  # scenario 1: images that follow a model link go to that model's folder
         folder = STATE["model_folder"]
-    elif STATE["model_failed"]:
+    elif STATE["model_failed"] and not own:
         log("  KEPT IN THE LIST: the model above was not downloaded, so the folder for this image is unknown")
         return "kept"
     elif flag(cfg, "USE_SUBFOLDER"):  # scenario 2: no model before - output folder (+ optional subfolder)
@@ -3212,13 +3219,16 @@ Downloads LoRA/model files from Civitai model links together with their example 
 
 QUICK START
 1. Connect: tick "Connect via Sign-in" (recommended; a browser window opens), or tick "Connect via API" and paste your Civitai API key (account settings -> API keys) in Setup, tab Connection. While you are signed in, the sign-in has priority over the API token. Hover over a box to see its state. Choose an "Output folder" (a category folder: one kind of models per folder).
-2. Put links into the list, one per line: model links (.../models/ID?modelVersionId=ID) and/or image links (.../images/ID).
-3. Press START. Finished links disappear from the list, failed ones stay.
+2. Add links: press Paste or Ctrl+V (several links in one text are fine), or send them from the browser. Every link becomes a row of the table: model links (.../models/ID?modelVersionId=ID) and/or image links (.../images/ID).
+3. Press START (it turns into STOP while a task runs). Finished links disappear from the table, failed ones stay.
+
+THE LINK TABLE
+One row per link: its status (checking, ok, warning, kept, hold; running, partial, error during and after a run), the link (the model name when known), the folder, the prefix, the number of examples and of gallery images (the last two columns can be hidden in Setup). A new link takes the values of the fields above the table (Output folder, Prefix, Model file, Examples, From gallery) and keeps them: changing the fields with nothing selected affects only the links added afterwards. To change links that are already in the table, select them (Ctrl or Shift for several): the header then says \"settings for: N selected\" and the fields work for the selected rows only (the box shows nothing where the selected rows differ). A model and the images below it form a pack and share one colour (the colours alternate between packs); the images follow the folder of their model. An image can be given a folder of its own by selecting it and changing the folder: it is then marked with *. Hold puts the selected rows on pause: START skips them until you press Resume; a model on hold holds its images too. A held image of a model that has been downloaded meanwhile still goes to that model's folder. Keys: Delete removes the selected rows, Ctrl+A selects all, Ctrl+V pastes links, Ctrl+C copies the links, Ctrl+Z / Ctrl+Y undo and redo changes of the list, Esc deselects; a double click opens the page in the browser. The table is kept between runs of the program. The options of Setup apply to all links.
 
 WHERE THINGS GO
 - Every model gets its own folder inside the Output folder, named after the model (characters that Windows does not allow are replaced).
 - If a folder with that name already holds ANOTHER model (or one nobody can identify), the new model goes into a separate folder named "Model name (model id)". The same model later finds its own folder again.
-- Image links that follow a model link in the list go into that model's folder, continue the numbering and add their metadata to the same description file. A new model link starts a new folder. The model folder is remembered only within one run.
+- Image links that follow a model link in the table go into that model's folder, continue the numbering and add their metadata to the same description file. A new model link starts a new folder. The model folder is remembered only within one run.
 - Image links with no model link before them go to the Output folder, or into the subfolder when "Image subfolder" is ticked (a name, a nested path a/b/c, or a full path).
 - A model link is removed from the list only after the image links below it are finished, so after a Stop or an error the rest of the list still knows its folder.
 
@@ -3270,73 +3280,160 @@ def link_key(u):
     return "i:%s" % m.group(1) if m else u
 
 
-def run_task(cfg, urls, log, stop, ask, done=None):
-    diag_reset()
-    try:
-        DIAG["site"] = urllib.parse.urlparse(str(urls[0])).netloc if urls else ""
-    except ValueError:
-        DIAG["site"] = ""
-    DIAG["active"] = True  # DIAG lines go to the log only while a task runs (not while links are merely being checked)
-    try:
-        return _run_task(cfg, urls, log, stop, ask, done)
-    finally:
-        DIAG["active"] = False
+# ---- the task engine: a task is a list of jobs (one link = one job with its OWN settings)
+class Job:
+    """One link of a task. The settings belong to the job (a copy made when the job is queued), so that different links of one task can
+    later have different folders, prefixes, numbers of examples and so on. parent: the model job that a single-image link follows
+    (the image goes into that model's folder). status: pending / ok / skipped / partial / kept / error."""
+    __slots__ = ("url", "cfg", "kind", "parent", "key", "status", "note")
+
+    def __init__(self, url, cfg, kind, parent=None):
+        self.url, self.cfg, self.kind, self.parent = url, cfg, kind, parent
+        self.key = link_key(url)
+        self.status, self.note = "pending", ""
 
 
-def _run_task(cfg, urls, log, stop, ask, done=None):
-    """Processes the links in order. done(url) is called for every link that is finished, so the
-    caller can remove it from its list. A model link is reported as finished only after all
-    single-image links directly below it are finished too; if the run is stopped or an image fails,
-    the model link stays in the list and re-establishes the folder on the next run."""
-    done = done or (lambda u: None)
-    log("Civitai Grabber v%s" % VERSION)
-    log("Log file: %s" % LOGFILE)
-    STATE.update({"log": log, "bridge_failures": 0, "bridge_off": False, "stop": stop, "blocked": 0, "page_blocked": False, "model_folder": None,
-                  "model_name": None, "model_failed": False, "pillow_warned": False, "net_fail": 0, "net_down": False,
-                  "made_dirs": [], "parts": set()})
+def link_kind(url):
+    return "model" if "/models/" in url else ("image" if "/images/" in url else "other")
+
+
+def make_jobs(urls, cfg):
+    """Jobs from a list of links; every job gets its own copy of the settings. A single-image link that follows a model link
+    belongs to that model (it is downloaded into the model's folder with the examples)."""
+    jobs, last_model = [], None
+    for u in urls:
+        kind = link_kind(u)
+        job = Job(u, dict(cfg), kind, last_model if kind == "image" else None)
+        if kind == "model":
+            last_model = job
+        jobs.append(job)
+    return jobs
+
+
+def check_job_cfg(cfg, log):
+    """The checks that were made once 'on start': the settings of a job with the defaults filled in, or None (the reason is logged)."""
     cfg = {**DEFAULTS, **cfg}
     if cfg["TOKEN"]:
         SECRETS.add(cfg["TOKEN"])
     if not cfg["PATH"]:
         log("No output folder given (PATH).")
-        return
+        return None
     try:
         os.makedirs(cfg["PATH"], exist_ok=True)
     except OSError as e:
         log("Cannot create the output folder: %s" % e)
-        return
+        return None
     pics = str(cfg.get("PICS", "")).strip().lower()
     gal = str(cfg.get("GALLERY", "")).strip().lower()
     for label, val in (("Examples", pics), ("From gallery", gal)):
         if val and val not in ("all", "*") and not val.isdigit():
             log("%s must be a number, all, or empty (now: %r)." % (label, val))
-            return
+            return None
+    return cfg
+
+
+def run_task(cfg, urls, log, stop, ask, done=None):
+    """A task of links that all have the same settings (the window and task files work this way for now)."""
+    return run_jobs(make_jobs(urls, cfg), log, stop, ask, done, fallback_cfg=cfg)
+
+
+def run_jobs(jobs, log, stop, ask, done=None, fallback_cfg=None, on_job=None):
+    diag_reset()
+    try:
+        DIAG["site"] = urllib.parse.urlparse(str(jobs[0].url)).netloc if jobs else ""
+    except ValueError:
+        DIAG["site"] = ""
+    DIAG["active"] = True  # DIAG lines go to the log only while a task runs (not while links are merely being checked)
+    try:
+        return _run_jobs(jobs, log, stop, ask, done, fallback_cfg, on_job)
+    finally:
+        DIAG["active"] = False
+
+
+def _run_jobs(jobs, log, stop, ask, done=None, fallback_cfg=None, on_job=None):
+    """Processes the jobs in order. done(url) is called for every link that is finished, so the
+    caller can remove it from its list. A model link is reported as finished only after all
+    single-image links directly below it are finished too; if the run is stopped or an image fails,
+    the model link stays in the list and re-establishes the folder on the next run."""
+    done = done or (lambda u: None)
+    on_job = on_job or (lambda u, status: None)  # on_job(url, "running" | final status): the window shows it in the table
+    log("Civitai Grabber v%s" % VERSION)
+    log("Log file: %s" % LOGFILE)
+    STATE.update({"log": log, "bridge_failures": 0, "bridge_off": False, "stop": stop, "blocked": 0, "page_blocked": False, "model_folder": None,
+                  "model_name": None, "model_failed": False, "pillow_warned": False, "net_fail": 0, "net_down": False,
+                  "made_dirs": [], "parts": set()})
+    checked = []  # the settings of the jobs are checked once per distinct set of settings
+    for job in (jobs or [None]):
+        base = job.cfg if job else (fallback_cfg or {})
+        known = next((r for c, r in checked if c == base), None)
+        if known is None:
+            known = check_job_cfg(base, log)
+            if known is None:
+                return
+            checked.append((base, known))
+        if job:
+            job.cfg = dict(known)  # every job keeps a settings dictionary of its own
     STATE["made_dirs"], STATE["parts"] = [], set()
-    cfg["TOKEN"] = AUTH.begin_run(urls, cfg["TOKEN"], log)
-    log("Links in the task: %d" % len(urls))
-    TB.update({"phase": "connecting", "failed": 0, "total": len(urls), "idx": 0, "cur": 0.0})
+    urls = [j.url for j in jobs]
+    token = AUTH.begin_run(urls, (jobs[0].cfg if jobs else checked[0][1])["TOKEN"], log)  # the credentials belong to the run
+    for job in jobs:
+        job.cfg["TOKEN"] = token
+    log("Links in the task: %d" % len(jobs))
+    TB.update({"phase": "connecting", "failed": 0, "total": len(jobs), "idx": 0, "cur": 0.0})
     seen = {}  # link key -> finished OK?
-    group = {"url": None, "ok": True}
+    group = {"url": None, "ok": True, "wait": None}
+    pending = []  # models downloaded with some failed images that wait for the answer at the end of the list: (url, name, note)
+
+    def partial_policy(c):
+        mode = str(c.get("ON_PARTIAL", "ask")).strip().lower()
+        mode = mode if mode in ("ask", "keep", "finish") else "ask"
+        when = str(c.get("PARTIAL_NOTICE", "each")).strip().lower()
+        when = when if when in ("each", "end", "none") else "each"
+        return mode, ("each" if (mode == "ask" and when == "none") else when)  # a question cannot be skipped
+
+    def decide(items, mode, when):
+        """True = keep the models in the list with the Model file switched off, to complete them later; False = finish them as they are."""
+        head = ("The model was downloaded, but some of its images were not:" if len(items) == 1
+                else "%d models were downloaded, but some of their images were not:" % len(items))
+        names = "\n".join("  %s - %s" % (nm, nt) for _u, nm, nt in items)
+        if mode == "ask":
+            return bool(ask("%s\n%s\n\nKeep %s in the list (Model file switched off) to complete %s later?\n\n"
+                            "Yes: keep in the list.   No: finish as it is." % (head, names, "it" if len(items) == 1 else "them", "it" if len(items) == 1 else "them")))
+        keep = mode == "keep"
+        if when != "none":
+            on_job("", "notice:%s\n%s\n\n%s" % (head, names, "Kept in the list with the Model file switched off." if keep else "Finished as they are."))
+        return keep
+
+    def keep_model(u):
+        ATTENTION.pop(u, None)
+        on_job(u, "keep")
+        log("  KEPT IN THE LIST: the model is downloaded; only its images will be completed on the next run (Model file is switched off for this row)")
 
     def close_group():
         if group["url"] and group["ok"]:
-            done(group["url"])
-        group["url"], group["ok"] = None, True
+            if group["wait"]:
+                pending.append(group["wait"])  # the answer comes at the end of the list
+            else:
+                done(group["url"])
+        group["url"], group["ok"], group["wait"] = None, True, None
 
-    for i, u in enumerate(urls, 1):
+    for i, job in enumerate(jobs, 1):
+        u, cfg, k = job.url, job.cfg, job.key
         if stop.is_set():
             log("Stopped.")
             safe_cleanup(log)
             return
-        log("[%d/%d] %s" % (i, len(urls), u))
+        log("[%d/%d] %s" % (i, len(jobs), u))
         TB["idx"], TB["cur"] = i - 1, 0.0
-        k = link_key(u)
+        on_job(u, "running")
         if k in seen:
             log("  SKIPPED: this link already appeared earlier in the list")
+            job.status = "skipped"
+            on_job(u, "skipped")
             if seen[k]:
                 done(u)
             continue
-        is_model = "/models/" in u
+        is_model = job.kind == "model"
         if is_model:
             close_group()
             STATE["model_folder"], STATE["model_failed"], STATE["model_name"] = None, False, None
@@ -3344,7 +3441,7 @@ def _run_task(cfg, urls, log, stop, ask, done=None):
         res = None
         try:
             if is_model:
-                nxt = urls[i] if i < len(urls) else ""
+                nxt = jobs[i].url if i < len(jobs) else ""
                 res = process_model(u, cfg, log, stop, ask, next_is_image="/images/" in nxt)
             elif "/images/" in u:
                 res = process_image(u, cfg, log, stop, ask)
@@ -3352,8 +3449,10 @@ def _run_task(cfg, urls, log, stop, ask, done=None):
                 log("  Unrecognised link (expected /models/ or /images/)")
                 res = "kept"
             ok = res in ("ok", "skipped", "partial")
+            job.status = res or "error"
             if res == "partial":
                 note = STATE.pop("partial_note", "some files were not downloaded")
+                job.note = note
                 ATTENTION[u] = note
                 TB["failed"] += 1
                 log("  ATTENTION: %s - the browser page of this link stays open and is marked in the extension window" % note)
@@ -3362,6 +3461,7 @@ def _run_task(cfg, urls, log, stop, ask, done=None):
             safe_cleanup(log)
             return
         except urllib.error.HTTPError as e:
+            job.status = "error"
             hint = ""
             if e.code in (401, 403):
                 hint = " - the model may be paid (buzz) or in early access, or the token is not accepted"
@@ -3374,6 +3474,7 @@ def _run_task(cfg, urls, log, stop, ask, done=None):
                 diag_event(e, e.url, final=True)
             history_add(k, u, cfg["PATH"], "error HTTP %s" % e.code)
         except Exception as e:  # noqa
+            job.status = "error"
             log("  ERROR: %s: %s" % (type(e).__name__, e))
             file_log(traceback.format_exc())
             if isinstance(e, (urllib.error.URLError, OSError, http.client.HTTPException, json.JSONDecodeError)) \
@@ -3381,18 +3482,35 @@ def _run_task(cfg, urls, log, stop, ask, done=None):
                 diag_event(e, u, final=True)
             history_add(k, u, cfg["PATH"], "error %s" % type(e).__name__)
         seen[k] = ok
+        on_job(u, job.status)
         if not ok:
             TB["failed"] += 1
         if is_model:
             if not ok:
                 STATE["model_failed"], STATE["model_folder"] = True, None
             group["url"], group["ok"] = u, ok
+            if ok and res == "partial":
+                mode_, when_ = partial_policy(cfg)
+                info_ = (u, STATE.get("model_name") or u, job.note)
+                if when_ == "end":
+                    group["wait"], group["cfg"] = info_, cfg
+                elif decide([info_], mode_, when_):
+                    group["ok"] = False
+                    keep_model(u)
         elif ok:
             done(u)
         elif group["url"]:
             group["ok"] = False
         time.sleep(0.7)
     close_group()
+    if pending:
+        mode_, when_ = partial_policy(group.get("cfg") or {})
+        if decide(pending, mode_, when_):
+            for u_, _nm, _nt in pending:
+                keep_model(u_)
+        else:
+            for u_, _nm, _nt in pending:
+                done(u_)
     safe_cleanup(log)
     log("Done.")
 
@@ -3529,13 +3647,25 @@ def checkbox_png(px, checked, border, fill, mark, gap=0):
 class Tooltip:
     """Small hover hint for a Tk widget."""
 
-    def __init__(self, widget, text, delay=600):
-        self.widget, self.text, self.delay = widget, text, delay
+    def __init__(self, widget, text, delay=600, wrap=380, when=None, pos=None):
+        """when(event) -> bool: the hint belongs to a part of the widget only (checked while the pointer moves);
+        pos() -> (x, y): where the hint appears (screen coordinates); wrap: line width in pixels (a number or a function)."""
+        self.widget, self.text, self.delay, self.wrap, self.when, self.pos = widget, text, delay, wrap, when, pos
         self.tip = None
         self.job = None
-        widget.bind("<Enter>", self._schedule, "+")
+        if when is None:
+            widget.bind("<Enter>", self._schedule, "+")
+        else:
+            widget.bind("<Motion>", self._motion, "+")
         widget.bind("<Leave>", self._hide, "+")
         widget.bind("<ButtonPress>", self._hide, "+")
+
+    def _motion(self, e):
+        if self.when(e):
+            if self.tip is None and self.job is None:
+                self.job = self.widget.after(self.delay, self._show)
+        else:
+            self._hide()
 
     def _schedule(self, _e=None):
         self._hide()
@@ -3547,13 +3677,17 @@ class Tooltip:
         if self.tip is not None:
             return
         text = self.text() if callable(self.text) else self.text
-        x = self.widget.winfo_rootx() + 12
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        if self.pos:
+            x, y = self.pos()
+        else:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        wrap = self.wrap() if callable(self.wrap) else self.wrap
         self.tip = tk.Toplevel(self.widget)
         self.tip.wm_overrideredirect(True)
         self.tip.wm_geometry("+%d+%d" % (x, y))
         tk.Label(self.tip, text=text, justify="left", background=TIP_COLORS["bg"], foreground=TIP_COLORS["fg"], relief="solid",
-                 borderwidth=1, padx=6, pady=3, wraplength=380).pack()
+                 borderwidth=1, padx=6, pady=3, wraplength=wrap).pack()
 
     def _hide(self, _e=None):
         if self.job is not None:
@@ -3565,9 +3699,11 @@ class Tooltip:
 
 
 EXISTING_LABELS = [("Ask", "ask"), ("Skip", "skip"), ("Download again", "overwrite")]
+PARTIAL_LABELS = [("Ask", "ask"), ("Keep in queue", "keep"), ("Finish", "finish")]  # a model is downloaded, but some example/gallery images failed
+NOTICE_LABELS = [("After each job", "each"), ("At the end of the list", "end"), ("Don't notify", "none")]
 
 
-FLAG_KEYS = ("VIDEO", "ORIGINAL", "COMFY", "WEBP2JPG", "USE_SUBFOLDER", "BRIDGE", "DSCR_AS_MODEL", "MODEL", "RENAME_ID", "USE_API", "DARK", "CHECK_UPDATES")
+FLAG_KEYS = ("VIDEO", "ORIGINAL", "COMFY", "WEBP2JPG", "USE_SUBFOLDER", "BRIDGE", "DSCR_AS_MODEL", "MODEL", "RENAME_ID", "USE_API", "DARK", "CHECK_UPDATES", "COL_PICS", "COL_GALLERY")
 TEXT_KEYS = ("TOKEN", "PATH", "PREFIX", "PICS", "IMGFOLDER", "DSCR", "GALLERY")
 
 
@@ -3701,6 +3837,7 @@ def main_gui():
     auth_q = queue.Queue()  # things the sign-in thread wants done in the window
     choose_q = queue.Queue()
     done_q = queue.Queue()
+    job_q = queue.Queue()  # (link, status) from the engine: shown in the table
     stop = threading.Event()
     state = {"thread": None}
     tb = {"icon": "idle", "key": None, "key_t": 0.0, "attach_t": 0.0, "last_flash": 0.0, "blink": None, "hold": None, "hold_t": 0.0, "prog": TaskbarProgress()}
@@ -3718,6 +3855,8 @@ def main_gui():
     v = {k: tk.StringVar() for k in TEXT_KEYS}
     b = {k: tk.BooleanVar() for k in FLAG_KEYS}
     existing_var = tk.StringVar(value="Ask")
+    partial_var = tk.StringVar(value="Ask")
+    notice_var = tk.StringVar(value="After each job")
 
     # ---- settings
     frm = ttk.Frame(root, padding=(8, 8, 8, 4))
@@ -3767,6 +3906,12 @@ def main_gui():
         w = row_path.winfo_rootx() + row_path.winfo_width() - left
         if w > 60:
             prefix_box.configure(width=w, height=e_prefix.winfo_reqheight() + 4)
+            try:  # the main button is as wide as the prefix field
+                cur = start_btn.winfo_reqwidth()
+                if abs(cur - w) > 2:
+                    start_btn.configure(padx=max(6, int(float(start_btn.cget("padx"))) + (w - cur) // 2))
+            except (tk.TclError, NameError, ValueError):
+                pass
 
     align_state = {"after": None}
 
@@ -3789,8 +3934,10 @@ def main_gui():
         except tk.TclError:
             pass
 
+    ui_state = {"only_img": False}  # only single-image rows are selected: they have a folder only, the other fields are greyed out
+
     def sync_fields(*_):  # prefix is greyed out without Model file
-        e_prefix.configure(state="normal" if b["MODEL"].get() else "disabled")
+        e_prefix.configure(state="normal" if b["MODEL"].get() and not ui_state["only_img"] else "disabled")
         sync_setup()
 
     for key in ("USE_SUBFOLDER", "DSCR_AS_MODEL", "MODEL"):
@@ -3807,7 +3954,9 @@ def main_gui():
 
     hdr = ttk.Frame(top_pane)  # "Links" title on the left, option checkboxes on the right
     hdr.pack(fill="x", pady=(2, 0))
-    ttk.Label(hdr, text="Links (one per line):").pack(side="left")
+    hdr_var = tk.StringVar(value="Links (settings for: next links)")  # which links the fields below change: all, or the selected rows
+    hdr_label = ttk.Label(hdr, textvariable=hdr_var)
+    hdr_label.pack(side="left")
     cb_model = ttk.Checkbutton(hdr, text="Model file", variable=b["MODEL"])
     count_values = ["all"] + [str(n) for n in range(0, 21)]  # typing any number or "all" still works
     e_gal = ttk.Combobox(hdr, textvariable=v["GALLERY"], values=count_values, width=5, height=12)
@@ -3821,56 +3970,70 @@ def main_gui():
     cb_model.pack(side="right")
     actions = ttk.Frame(top_pane, padding=(0, 10, 0, 6))
     actions.pack(side="bottom", fill="x")
-    urlbox = ScrollText(top_pane, height=6, wrap="none", font=mono, undo=True)
-    urlbox.pack(fill="both", expand=True, pady=(8, 0))
+    tbl_frame = ttk.Frame(top_pane)
+    tbl_frame.pack(fill="both", expand=True, pady=(8, 0))
+    TABLE_COLS = (("status", "Status", 98, "w"), ("link", "Link", 260, "w"), ("folder", "Folder", 170, "w"),
+                  ("prefix", "Prefix", 80, "w"), ("pics", "Examples", 84, "center"), ("gallery", "Gallery", 68, "center"))
+    tree = ttk.Treeview(tbl_frame, columns=[c[0] for c in TABLE_COLS], show="headings", selectmode="extended", height=6)
+    for key_, title_, width_, anchor_ in TABLE_COLS:
+        tree.heading(key_, text=title_, anchor="w" if anchor_ == "w" else "center")
+        tree.column(key_, width=width_, minwidth=120 if key_ == "link" else 44, anchor=anchor_, stretch=(key_ == "link"))  # (the Folder column joins in when columns are hidden)
+    tvbar = ttk.Scrollbar(tbl_frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=tvbar.set)
+    tvbar.pack(side="right", fill="y")
+    tree.pack(side="left", fill="both", expand=True)
 
     paste_btn = ttk.Button(actions, text="Paste")
     undo_btn = ttk.Button(actions, text="Undo", takefocus=False)
     redo_btn = ttk.Button(actions, text="Redo", takefocus=False)
     sample_btn = ttk.Button(actions, text="Create sample txt")  # hidden unless SHOW_TXT_BUTTONS
     load_btn = ttk.Button(actions, text="Load from txt…")
+    hold_btn = ttk.Button(actions, text="Hold")
     clear_btn = ttk.Button(actions, text="Clear all")
-    shown = [paste_btn] + ([sample_btn, load_btn] if SHOW_TXT_BUTTONS else []) + [undo_btn, redo_btn, clear_btn]
+    shown = [paste_btn] + ([sample_btn, load_btn] if SHOW_TXT_BUTTONS else []) + [undo_btn, redo_btn, hold_btn, clear_btn]
     for w in shown:
         w.pack(side="left", padx=(0, 6))
-    stop_btn = ttk.Button(actions, text="Stop", state="disabled")
     class StartButton(tk.Button):
-        """The main button: the same blue with white text as the buttons of the browser extension."""
-        COLORS = {"normal": ("#2162be", "#ffffff"), "disabled": ("#a9c1e6", "#ffffff")}
+        """The main button, one for both actions: START (blue, the same blue with white text as the buttons of the browser extension)
+        while nothing runs, STOP (amber) while a task runs, "Stopping..." (pale amber, not pressable) until the task has ended, and the
+        pale blue "locked" look while the links are being checked."""
+        MODES = {"start": ("START", "#2162be", "#ffffff", "#1b4f99"), "locked": ("START", "#a9c1e6", "#ffffff", None),
+                 "stop": ("STOP", "#f0a830", "#1b1b1b", "#e29a1c"), "stopping": ("Stopping\u2026", "#f3dca9", "#6b5a35", None)}
 
         def __init__(self, master, **kw):
             f = tkfont.nametofont("TkDefaultFont").copy()
             f.configure(weight="bold")
             bg = ttk.Style(master).lookup("TFrame", "background") or "#f0f0f0"
-            tk.Button.__init__(self, master, font=f, relief="flat", bd=0, padx=16, pady=2, cursor="hand2",
-                               activebackground="#163f7a", activeforeground="#ffffff", disabledforeground="#ffffff",
-                               highlightthickness=2, highlightbackground=bg, highlightcolor=bg, **kw)
+            self.mode = "start"
+            tk.Button.__init__(self, master, font=f, relief="flat", bd=0, padx=16, pady=2, cursor="hand2", width=9,
+                               activeforeground="#ffffff", highlightthickness=2, highlightbackground=bg, highlightcolor=bg, **kw)
             self.ring_hidden, self.ring_shown = bg, "#163f7a"
-            self._paint("normal")
+            self.set_mode("start")
             self.bind("<Enter>", lambda e: self._hover(True))
             self.bind("<Leave>", lambda e: self._hover(False))
 
-        def _paint(self, state):
-            bg, fg = self.COLORS[state]
-            tk.Button.configure(self, bg=bg, fg=fg)
+        def set_mode(self, mode):
+            self.mode = mode
+            text, bg, fg, hover = self.MODES[mode]
+            off = hover is None
+            tk.Button.configure(self, text=text, bg=bg, fg=fg, activebackground=hover or bg, activeforeground=fg, disabledforeground=fg,
+                                state="disabled" if off else "normal", cursor="arrow" if off else "hand2")
 
         def _hover(self, inside):
-            if str(self.cget("state")) != "disabled":
-                tk.Button.configure(self, bg="#1b4f99" if inside else self.COLORS["normal"][0])
+            text, bg, fg, hover = self.MODES[self.mode]
+            if hover:
+                tk.Button.configure(self, bg=hover if inside else bg)
 
         def configure(self, cnf=None, **kw):
             res = tk.Button.configure(self, cnf, **kw) if (cnf or kw) else tk.Button.configure(self)
-            if "state" in kw:
-                st = str(kw["state"])
-                self._paint("disabled" if st == "disabled" else "normal")
-                tk.Button.configure(self, cursor="arrow" if st == "disabled" else "hand2")
+            if "state" in kw and self.mode in ("start", "locked"):  # callers that only lock / unlock START
+                self.set_mode("locked" if str(kw["state"]) == "disabled" else "start")
             return res
 
         config = configure
 
     start_btn = StartButton(actions, text="START")
-    stop_btn.pack(side="right")
-    start_btn.pack(side="right", padx=(0, 6))
+    start_btn.pack(side="right")
 
     logbtns = ttk.Frame(bottom_pane, padding=(0, 4, 0, 0))
     logbtns.pack(side="bottom", fill="x")
@@ -3878,11 +4041,16 @@ def main_gui():
     openlog_btn = ttk.Button(logbtns, text="Open log file")
     copylog_btn.pack(side="left", padx=(0, 6))
     openlog_btn.pack(side="left")
-    help_btn = ttk.Button(row_tk, text="?", width=3)
-    help_btn.pack(side="right", before=cb_signin)  # packed before the left-hand boxes: when the window is narrow they keep their room
+    icons_box = ttk.Frame(row_tk)  # the gear and the question mark always get cells of the same size
+    icons_box.pack(side="right", before=cb_signin)  # packed before the left-hand boxes: when the window is narrow they keep their room
+    icons_box.columnconfigure(0, uniform="ib")
+    icons_box.columnconfigure(2, uniform="ib")
+    icons_box.columnconfigure(1, minsize=6)
+    help_btn = ttk.Button(icons_box, text="?", width=3)
+    help_btn.grid(row=0, column=2, sticky="nsew")
     GEARS = {mode: tk.PhotoImage(data=base64.b64encode(gear_icon_png(scale / 1.5, mode == "dark"))) for mode in ("light", "dark")}
-    setup_btn = ttk.Button(row_tk, image=GEARS["light"], width=3)  # the gear: Setup (a drawn picture, the same on every system)
-    setup_btn.pack(side="right", padx=(0, 6), before=cb_signin)
+    setup_btn = ttk.Button(icons_box, image=GEARS["light"], width=3)  # the gear: Setup (a drawn picture, the same on every system)
+    setup_btn.grid(row=0, column=0, sticky="nsew")
     upd_font = tkfont.nametofont("TkDefaultFont").copy()
     upd_font.configure(underline=True)
     upd_lbl = ttk.Label(row_tk, text="", cursor="hand2", font=upd_font, foreground="#0b57d0", padding=1, borderwidth=1, relief="flat",
@@ -3910,12 +4078,11 @@ def main_gui():
         widget.bind("<Shift-Tab>", lambda e: go(e, True))
         widget.bind("<ISO_Left_Tab>", lambda e: go(e, True))
 
-    tab_out(urlbox)
     tab_out(box)
-    for sb in (urlbox.vbar, box.vbar):
+    for sb in (tvbar, box.vbar):
         sb.configure(takefocus=0)
     # Tab order follows the stacking order of the widgets, which is the order of creation: put it in the order of the screen
-    for w in (upd_lbl, setup_btn, help_btn, cb_model, e_pics, e_gal, actions):
+    for w in (setup_btn, help_btn, upd_lbl, icons_box, cb_model, e_pics, e_gal, actions):
         w.lift()
     for cls in ("TButton", "Button"):
         root.bind_class(cls, "<Return>", lambda e: (e.widget.invoke(), "break")[1])
@@ -4203,6 +4370,7 @@ def main_gui():
         icon_mode["cur"] = mode
         setup_btn.configure(image=GEARS[mode])
         refresh_link()
+        style_table(bool(dark))
         refresh_titlebars()
         align_later()
 
@@ -4270,7 +4438,6 @@ def main_gui():
                      (e_pics, "PICS"), (e_gal, "GALLERY")):
         UndoEntry(ent, v[key])
         attach_menu(ent)
-    attach_menu(urlbox)
     attach_menu(box, editable=False)
 
     for widget, text in (
@@ -4292,16 +4459,16 @@ def main_gui():
             (link_btn, "Link the prefix to the output folder. Rings joined: linked - the prefix is filled in whenever this folder is chosen; "
                        "click to unlink. Rings apart: not linked, or the prefix was changed - click to link the prefix typed now to this folder. "
                        "Editing the prefix is never blocked."),
-            (urlbox, "Model links (…/models/ID) and single image links (…/images/ID), one per line. "
-                     "Finished links disappear from the list; failed ones stay."),
+
             (undo_btn, "Undo the last change in the box you were working in (the link list by default). Ctrl+Z does the same."),
             (redo_btn, "Redo what was undone. Ctrl+Y does the same."),
+            (hold_btn, "Hold: put the selected links on pause - START skips them until you press Resume. A model on hold holds its images too."),
             (sample_btn, "Save an empty task-file template (all keys, no data) and open it in your text editor."),
             (load_btn, "Load settings and links from a task txt file. Empty keys are ignored, so the file may hold only links."),
             (paste_btn, "Add the clipboard text to the end of the list."),
             (clear_btn, "Remove all links from the list."),
-            (start_btn, "Start downloading all links in the list."),
-            (stop_btn, "Stop after the current step."),
+            (start_btn, lambda: {"start": "Start downloading all links in the list.", "locked": "Locked until the links are checked and decided.",
+                                 "stop": "Stop after the current step.", "stopping": "Stopping after the current step ..."}[start_btn.mode]),
             (copylog_btn, "Copy the whole log to the clipboard."),
             (openlog_btn, "Open civitai_grabber.log in the default editor."),
             (cb_bridge, lambda: "Local port 127.0.0.1 for the browser extension, which fetches image pages with your logged-in browser.\nNow: %s." % bridge_status()),
@@ -4309,6 +4476,27 @@ def main_gui():
             (help_btn, "Short help.")):
         Tooltip(widget, text)
 
+    # the hint of the link table: only on the "Links" title and on the heading strip (Status ... Prefix), and inside the table
+    TABLE_HELP = ("One row per link, with its own settings. A new link takes the values of the fields above and keeps them; to change links already "
+                  "in the table, select them first (Ctrl or Shift for several). A model and the images below it share one colour; the images follow "
+                  "the folder of their model (* = an image with a folder of its own). Finished links disappear, failed ones stay (after a restart "
+                  "they come back on hold). Hold pauses the selected rows, a model holds its images. Delete removes, Ctrl+V pastes, Esc deselects, "
+                  "a double click opens the page.")
+
+    def over_heads(e):
+        if tree.identify_region(e.x, e.y) != "heading":
+            return False
+        dc = tree["displaycolumns"]
+        ids = [c[0] for c in TABLE_COLS] if dc in (("#all",), "#all") else list(dc)
+        try:
+            k = int(tree.identify_column(e.x)[1:]) - 1
+        except ValueError:
+            return False
+        return 0 <= k < len(ids) and ids[k] in ("status", "link", "folder", "prefix")
+
+    Tooltip(hdr_label, TABLE_HELP, wrap=560)
+    Tooltip(tree, TABLE_HELP, when=over_heads, wrap=lambda: max(200, min(560, tree.winfo_width() - 30)),
+            pos=lambda: (tree.winfo_rootx() + 8, tree.winfo_rooty() + 30))
 
     # ---- prefix linked to an output folder (every folder has its own link; the prefix stays editable)
     prefix_map = {}
@@ -4353,6 +4541,9 @@ def main_gui():
         refresh_link()
 
     def on_path_change(*_):
+        if ctx["loading"]:  # the field is only showing another row's value
+            refresh_link()
+            return
         link_ctx["path_at"] = time.time()
         if link_ctx["after"]:
             root.after_cancel(link_ctx["after"])
@@ -4473,6 +4664,10 @@ def main_gui():
         if "EXISTING" in d:
             ex = str(d["EXISTING"]).lower()
             existing_var.set(next((lbl for lbl, code in EXISTING_LABELS if code == ex), "Ask"))
+        if "ON_PARTIAL" in d:
+            partial_var.set(next((lbl for lbl, code in PARTIAL_LABELS if code == str(d["ON_PARTIAL"]).lower()), "Ask"))
+        if "PARTIAL_NOTICE" in d:
+            notice_var.set(next((lbl for lbl, code in NOTICE_LABELS if code == str(d["PARTIAL_NOTICE"]).lower()), "After each job"))
         if d.get("TOKEN") and "USE_API" not in d:
             b["USE_API"].set(True)  # a task file with a token: the token is meant to be used
         set_lock(bool(v["TOKEN"].get().strip()))
@@ -4482,11 +4677,424 @@ def main_gui():
         for k in FLAG_KEYS:
             cfg[k] = "1" if b[k].get() else "0"
         cfg["TOKEN"] = active_token()
+        for k in ROW_KEYS:
+            if k in defaults:
+                cfg[k] = defaults[k]
         cfg["EXISTING"] = next((code for lbl, code in EXISTING_LABELS if lbl == existing_var.get()), "ask")
+        cfg["ON_PARTIAL"] = next((code for lbl, code in PARTIAL_LABELS if lbl == partial_var.get()), "ask")
+        cfg["PARTIAL_NOTICE"] = next((code for lbl, code in NOTICE_LABELS if lbl == notice_var.get()), "each")
         return cfg
 
+    # ---- the link table: a list of rows, a row = a link + ITS OWN settings. A link takes the values of the fields above the table
+    # when it is added (the "next links" values) and keeps them, whatever the fields show later; selected rows are edited one by one.
+    # A single image under a model has no folder of its own: it follows the model above it, until it is given a folder explicitly.
+    ROW_KEYS = ("PATH", "PREFIX", "PICS", "GALLERY", "MODEL")  # the settings of one link ("MODEL" is "1" or "0")
+    ROW_EXTRA = ("HOLD", "DIR", "WAS", "MODELDONE")  # HOLD "1" = on hold (WAS = the result it had when the program was closed: error/partial); DIR = the exact folder of an image whose model was finished while the image waited; MODELDONE "1" = the model is already downloaded, only images remain
+    URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
+
+    class Row:
+        __slots__ = ("id", "url", "ov")  # ov: the values of this row (saved under the old name)
+
+        def __init__(self, rid, url, ov=None):
+            self.id, self.url = rid, url
+            self.ov = {k: str(x) for k, x in (ov or {}).items() if k in ROW_KEYS or k in ROW_EXTRA}
+
+    table = {"rows": [], "next": 1, "undo": [], "redo": [], "state": {}}  # state: link -> what the engine reports (running, error...)
+    defaults = {}  # the values of the fields when nothing is selected: they are given to the links added NEXT
+    ctx = {"loading": False}
+    shown = {}  # row id of the tree -> (values, tag): what the table shows now
+
     def current_links():
-        return [ln.strip() for ln in urlbox.get("1.0", "end").splitlines() if ln.strip().lower().startswith("http")]
+        return [r.url for r in table["rows"]]
+
+    def extract_urls(text):
+        return [m.group(0).rstrip(".,;") for m in URL_RE.finditer(text or "")]
+
+    def snapshot():
+        return [(r.url, dict(r.ov)) for r in table["rows"]]
+
+    def new_row(url, ov=None):
+        r = Row(table["next"], url, ov)
+        table["next"] += 1
+        return r
+
+    def push_undo():
+        table["undo"].append(snapshot())
+        del table["undo"][:-100]
+        table["redo"].clear()
+
+    def set_rows(snap):
+        table["rows"] = [new_row(u, ov) for u, ov in snap]
+        render_table(False)
+        on_select()
+
+    def undo_rows():
+        if table["undo"]:
+            table["redo"].append(snapshot())
+            set_rows(table["undo"].pop())
+
+    def redo_rows():
+        if table["redo"]:
+            table["undo"].append(snapshot())
+            set_rows(table["redo"].pop())
+
+    def field_default(key):
+        if key == "MODEL":
+            return "1" if b["MODEL"].get() else "0"
+        return v[key].get().strip()
+
+    def fresh_values(url, has_model):
+        """What a new row takes from the fields. A single image under a model takes nothing: it follows the model."""
+        if link_kind(url) == "image" and has_model:
+            return {}
+        return {k: defaults.get(k, field_default(k)) for k in ROW_KEYS}
+
+    def layout():
+        """(parent, pack): parent = row id of a single image -> the model row above it (the same rule the engine uses);
+        pack = row id -> 0 or 1 for a model that has images and for those images (the colours alternate from pack to pack)."""
+        parent, pack, last, n = {}, {}, None, -1
+        for r in table["rows"]:
+            kind = link_kind(r.url)
+            if kind == "model":
+                last = r
+            elif kind == "image" and last is not None and not r.ov.get("DIR"):
+                parent[r.id] = last
+                if last.id not in pack:
+                    n += 1
+                    pack[last.id] = n % 2
+                pack[r.id] = pack[last.id]
+        return parent, pack
+
+    def is_held(r, parent):
+        if r.ov.get("HOLD") == "1":
+            return True
+        p = parent.get(r.id)
+        return p is not None and p.ov.get("HOLD") == "1"  # the images of a model on hold wait with it
+
+    def active_links():  # the links that will be downloaded: not on hold
+        parent = layout()[0]
+        return [r.url for r in table["rows"] if not is_held(r, parent)]
+
+    def effective(r, parent=None):
+        """The values of a row as the engine uses them; an image under a model has that model's folder unless it has its own."""
+        if parent is None:
+            parent = layout()[0]
+        d = {k: defaults.get(k, field_default(k)) for k in ROW_KEYS}
+        d.update({k: x for k, x in r.ov.items() if k in ROW_KEYS})
+        p = parent.get(r.id)
+        if p is not None:
+            if "PATH" not in r.ov:
+                d["PATH"] = effective(p, parent)["PATH"]
+            d.update(PREFIX="", PICS="", GALLERY="", MODEL="")
+        elif r.ov.get("DIR"):
+            d.update(PATH=r.ov["DIR"], PREFIX="", PICS="", GALLERY="", MODEL="")
+        return d
+
+    def drop_same_as_parent():
+        """An image whose own folder is the folder of its model is just following it (the * marks only a different folder)."""
+        parent = layout()[0]
+        for r in table["rows"]:
+            p = parent.get(r.id)
+            if p is not None and "PATH" in r.ov and norm_path(r.ov["PATH"]) == norm_path(effective(p, parent)["PATH"]):
+                del r.ov["PATH"]
+
+    def freeze_orphans():
+        """An image that lost its model (the model row was removed and no model is above it) keeps the folder it has now."""
+        parent = layout()[0]
+        for r in table["rows"]:
+            if link_kind(r.url) == "image" and r.id not in parent and "PATH" not in r.ov and not r.ov.get("DIR"):
+                r.ov["PATH"] = defaults.get("PATH", field_default("PATH"))
+
+    def add_urls(urls):
+        """Adds new links (those not yet in the table) as one undo step; returns the added ones."""
+        have = set(current_links())
+        new = []
+        for u in urls:
+            if u not in have:
+                have.add(u)
+                new.append(u)
+        if new:
+            push_undo()
+            has_model = any(link_kind(r.url) == "model" for r in table["rows"])
+            for u in new:
+                table["rows"].append(new_row(u, fresh_values(u, has_model)))
+                has_model = has_model or link_kind(u) == "model"
+            render_table()
+            kids = tree.get_children()
+            if kids:
+                tree.see(kids[-1])
+        return new
+
+    def selected_rows():
+        sel = set(tree.selection())
+        return [r for r in table["rows"] if "r%d" % r.id in sel]
+
+    def remove_rows(rows, remember=True):
+        ids = {r.id for r in rows}
+        if not ids:
+            return
+        if remember:
+            push_undo()
+        table["rows"] = [r for r in table["rows"] if r.id not in ids]
+        for r in rows:
+            table["state"].pop(r.url, None)
+        freeze_orphans()
+        render_table()
+        on_select()
+
+    def remove_selected(_e=None):
+        remove_rows(selected_rows())
+        return "break"
+
+    def select_all(_e=None):
+        tree.selection_set(tree.get_children())
+        return "break"
+
+    def clear_selection(_e=None):
+        tree.selection_set(())
+
+    def folder_chars():  # how many characters of a folder fit into the Folder column now
+        try:
+            w = int(tree.column("folder", "width"))
+        except (tk.TclError, ValueError):
+            w = 170
+        return max(18, int((w - 14) / 6.5))
+
+    def short_path(p, n=None):
+        p, n = p or "", n or folder_chars()
+        return p if len(p) <= n else "\u2026" + p[-(n - 1):]
+
+    def status_of(r):
+        st = table["state"].get(r.url)
+        if st:
+            return {"running": "running", "ok": "done"}.get(st, st)
+        if not MODEL_LINK.search(r.url):
+            return "image"
+        cs = checker.state.get(r.url)
+        if cs in (None, "queued"):
+            return "checking"
+        return {"problem": "warning", "kept": "kept"}.get(cs, "ok")
+
+    def link_text(r, child, e):
+        t = checker.titles.get(r.url)
+        if not t:
+            u = urllib.parse.urlparse(r.url)
+            t = u.path + (("?" + u.query) if u.query else "")
+        if link_kind(r.url) == "model" and e["MODEL"] != "1":
+            t += "   [model downloaded]" if r.ov.get("MODELDONE") else "   [no model file]"
+        return ("    " if child else "") + t
+
+    def row_tag(r, status, held, pack):
+        if status == "error":
+            return "error"
+        if status in ("warning", "partial", "kept"):
+            return "warning"
+        if held:
+            return "hold"
+        return "pack%d" % pack.get(r.id) if r.id in pack else ""
+
+    def row_values(r, info, n=None):
+        parent, pack = info
+        child = r.id in parent
+        e = effective(r, parent)
+        held = is_held(r, parent)
+        st = ("hold (%s)" % r.ov["WAS"] if r.ov.get("WAS") and r.ov.get("HOLD") == "1" else "hold") if held else status_of(r)
+        star = " *" if child and "PATH" in r.ov else ""  # an image with a folder of its own, not the folder of its model
+        return (st, link_text(r, child, e), short_path(e["PATH"], n) + star, e["PREFIX"], e["PICS"], e["GALLERY"]), row_tag(r, st, held, pack)
+
+    def render_table(keep_selection=True):
+        sel = set(tree.selection()) if keep_selection else set()
+        tree.delete(*tree.get_children())
+        shown.clear()
+        info, n = layout(), folder_chars()
+        for r in table["rows"]:
+            vals, tag = row_values(r, info, n)
+            iid = "r%d" % r.id
+            tree.insert("", "end", iid=iid, values=vals, tags=(tag,) if tag else ())
+            shown[iid] = (vals, tag)
+        keep = [i for i in sel if tree.exists(i)]
+        if keep:
+            tree.selection_set(keep)
+
+    def refresh_dynamic():  # statuses, titles and settings change by themselves (the link check, the run, the fields): update what differs
+        info, n = layout(), folder_chars()
+        for r in table["rows"]:
+            iid = "r%d" % r.id
+            old = shown.get(iid)
+            if old is None or not tree.exists(iid):
+                continue
+            vals, tag = row_values(r, info, n)
+            if vals != old[0]:
+                tree.item(iid, values=vals)
+            if tag != old[1]:
+                tree.item(iid, tags=(tag,) if tag else ())
+            shown[iid] = (vals, tag)
+
+    def style_table(dark):
+        st_ = ttk.Style(root)
+        if dark:
+            st_.configure("Treeview", background=DARK["field"], fieldbackground=DARK["field"], foreground=DARK["fg"], bordercolor=DARK["border"],
+                          rowheight=22)
+            st_.map("Treeview", background=[("selected", DARK["sel"])], foreground=[("selected", "#ffffff")])
+            st_.configure("Treeview.Heading", background=DARK["btn"], foreground=DARK["fg"], bordercolor=DARK["border"], relief="flat")
+            st_.map("Treeview.Heading", background=[("active", DARK["btn_hi"])])
+            colors = ("#f2877d", "#f0a830", "#8ab4f8", "#c58af9", "#7d8590")
+        else:
+            st_.configure("Treeview", rowheight=22)
+            colors = ("#b3261e", "#b45f06", "#0b57d0", "#8430ce", "#8a8f98")
+        for tag_, col in zip(("error", "warning", "pack0", "pack1", "hold"), colors):
+            tree.tag_configure(tag_, foreground=col)
+
+    def apply_columns():  # the Examples and Gallery columns can be hidden (Setup): the room goes to the Link and Folder columns
+        hide = {"pics": not b["COL_PICS"].get(), "gallery": not b["COL_GALLERY"].get()}
+        tree.configure(displaycolumns=[c[0] for c in TABLE_COLS if not hide.get(c[0])])
+        tree.column("folder", stretch=any(hide.values()))
+        root.after(250, refresh_dynamic)
+
+    resize_job = {"id": None}
+
+    def on_tree_resize(_e=None):  # the Folder column shows as much of the path as fits
+        if resize_job["id"]:
+            root.after_cancel(resize_job["id"])
+        resize_job["id"] = root.after(150, lambda: (resize_job.update(id=None), refresh_dynamic()))
+
+    # ---- the fields above the table show the values for the NEXT links (nothing selected) or the values of the selected rows and change them
+    def update_hold_btn():
+        rows = selected_rows()
+        parent = layout()[0]
+        resume = bool(rows) and all(is_held(r, parent) for r in rows)
+        hold_btn.configure(text="Resume" if resume else "Hold")
+        hold_btn.state(["!disabled"] if rows else ["disabled"])
+
+    def hold_toggle(_e=None):
+        rows = selected_rows()
+        if not rows:
+            return
+        parent = layout()[0]
+        if all(is_held(r, parent) for r in rows):  # Resume (an image held only because of its model waits until the model is resumed)
+            todo = [r for r in rows if r.ov.get("HOLD") == "1"]
+            if todo:
+                push_undo()
+                for r in todo:
+                    del r.ov["HOLD"]
+                    r.ov.pop("WAS", None)
+        else:
+            push_undo()
+            for r in rows:
+                r.ov["HOLD"] = "1"
+                r.ov.pop("WAS", None)
+        refresh_dynamic()
+        update_hold_btn()
+
+    def hold_label():
+        rows = selected_rows()
+        parent = layout()[0]
+        return "Resume" if rows and all(is_held(r, parent) for r in rows) else "Hold"
+
+    def load_fields():
+        """Shows the values for the next links, or the common values of the selected rows (nothing for values that differ)."""
+        rows = selected_rows()
+        parent = layout()[0]
+        ctx["loading"] = True
+        try:
+            for k in ROW_KEYS:
+                if rows:  # an image has only a folder; its other values mean nothing
+                    vals = {effective(r, parent)[k] for r in rows if k == "PATH" or link_kind(r.url) != "image"}
+                else:
+                    vals = {defaults.get(k, field_default(k))}
+                val = vals.pop() if len(vals) == 1 else None
+                if k == "MODEL":
+                    b["MODEL"].set(val == "1")
+                    cb_model.state(["alternate"] if val is None else ["!alternate"])
+                else:
+                    v[k].set(val if val is not None else "")
+        finally:
+            ctx["loading"] = False
+        n = len(rows)
+        ui_state["only_img"] = bool(rows) and all(link_kind(r.url) == "image" for r in rows)
+        for w in (e_pics,):
+            w.configure(state="disabled" if ui_state["only_img"] else "normal")
+        cb_model.state(["disabled"] if ui_state["only_img"] else ["!disabled"])
+        hdr_var.set("Links (settings for: %s)" % ("next links" if not n else "%d selected" % n))
+        refresh_link()
+        sync_fields()
+        update_hold_btn()
+
+    def on_select(_e=None):
+        load_fields()
+
+    def on_field_change(key, *_):
+        if ctx["loading"]:
+            return
+        val = ("1" if b["MODEL"].get() else "0") if key == "MODEL" else v[key].get().strip()
+        rows = selected_rows()
+        if key == "MODEL":
+            cb_model.state(["!alternate"])
+        if rows:
+            parent = layout()[0]
+            ids = {r.id for r in rows}
+            for r in rows:
+                if key == "PATH":
+                    if r.id in parent and parent[r.id].id in ids:  # it follows its model, which changes too
+                        r.ov.pop("PATH", None)
+                    else:
+                        r.ov["PATH"] = val
+                        r.ov.pop("DIR", None)
+                elif link_kind(r.url) != "image":
+                    r.ov[key] = val
+                    if key == "MODEL" and val == "1":
+                        r.ov.pop("MODELDONE", None)
+            drop_same_as_parent()
+        else:
+            defaults[key] = val
+        refresh_dynamic()
+
+    def push_defaults():
+        for k in ROW_KEYS:
+            defaults[k] = field_default(k)
+
+    def migrate_rows():
+        """Rows saved by v0.50 held only what differed from the common values: fill in the rest from the fields now."""
+        parent = layout()[0]
+        for r in table["rows"]:
+            if r.id in parent:
+                if saved.get("ROWS_VERSION", 1) < 2:
+                    r.ov.pop("PATH", None)  # v0.50 ignored the folder of an image under a model
+            else:
+                for k in ROW_KEYS:
+                    r.ov.setdefault(k, defaults.get(k, field_default(k)))
+
+    def keep_for_later(u):
+        """The engine finished a model but some images failed and the answer was 'keep': the row stays, the model is not downloaded again."""
+        for r in table["rows"]:
+            if r.url.strip() == u.strip():
+                r.ov["MODEL"], r.ov["MODELDONE"] = "0", "1"
+                table["state"][r.url] = "partial"
+                break
+
+    def freeze_held_children(u, folder):
+        """A model is finished, but an image below it was put on hold and stays: it keeps the folder of that model."""
+        model = next((r for r in table["rows"] if r.url.strip() == u.strip()), None)
+        if model is None or link_kind(model.url) != "model":
+            return
+        parent = layout()[0]
+        kids = [r for r in table["rows"] if parent.get(r.id) is model]
+        for r in kids:
+            if folder:
+                r.ov["DIR"] = folder
+                r.ov.pop("PATH", None)
+            else:
+                r.ov["PATH"] = effective(model, parent)["PATH"]
+
+    def copy_links():
+        rows = selected_rows() or table["rows"]
+        root.clipboard_clear()
+        root.clipboard_append("\n".join(r.url for r in rows))
+
+    def open_row(_e=None):
+        rows = selected_rows()
+        if rows:
+            webbrowser.open(rows[0].url)
 
     def log(msg):
         msg = scrub(msg)
@@ -4571,7 +5179,11 @@ def main_gui():
             if not use_file:
                 for k in conflicts:
                     take.pop(k, None)
+        clear_selection()
+        load_fields()
         set_values(take)
+        push_defaults()
+        render_table()
         if urls:
             if current_links():
                 ans = messagebox.askyesnocancel(
@@ -4580,12 +5192,10 @@ def main_gui():
                 if ans is None:
                     urls = []
                 elif ans:
-                    urlbox.delete("1.0", "end")
-            cur_text = urlbox.get("1.0", "end-1c")
-            if urls and cur_text and not cur_text.endswith("\n"):
-                urlbox.insert("end", "\n")
+                    push_undo()
+                    table["rows"] = []
             if urls:
-                urlbox.insert("end", "\n".join(urls) + "\n")
+                add_urls(urls)
         log("Loaded task file: %s (%d links, %d settings)" % (p, len(urls), len(take)))
 
     focus_w = {"w": None}
@@ -4594,21 +5204,25 @@ def main_gui():
         w = e.widget
         if isinstance(w, (tk.Text, ttk.Entry)) and w is not box:
             focus_w["w"] = w
+        elif w is tree:
+            focus_w["w"] = None
 
-    def target_widget():
+    def target_widget():  # the box the user was working in; None = the link table
         w = focus_w["w"]
         try:
             if w is None or not w.winfo_exists() or str(w.cget("state")) != "normal":
-                return urlbox
+                return None
         except tk.TclError:
-            return urlbox
+            return None
         return w
 
     def do_undo():
-        target_widget().event_generate("<<Undo>>")
+        w = target_widget()
+        undo_rows() if w is None else w.event_generate("<<Undo>>")
 
     def do_redo():
-        target_widget().event_generate("<<Redo>>")
+        w = target_widget()
+        redo_rows() if w is None else w.event_generate("<<Redo>>")
 
     root.bind_all("<FocusIn>", remember_focus, "+")
 
@@ -4629,30 +5243,25 @@ def main_gui():
         except tk.TclError:
             log("The clipboard is empty or does not contain text.")
             return
-        cur = urlbox.get("1.0", "end-1c")
-        if cur and not cur.endswith("\n"):
-            urlbox.insert("end", "\n")
-        urlbox.insert("end", text.strip("\r\n") + "\n")
-        urlbox.see("end")
+        urls = extract_urls(text)
+        if not urls:
+            log("The clipboard holds no links.")
+            return
+        add_urls(urls)
 
     def add_links(links):
-        have = set(current_links())
-        new = []
-        for u in links:
-            if u not in have:
-                have.add(u)
-                new.append(u)
+        new = add_urls(links)
         if new:
-            cur = urlbox.get("1.0", "end-1c")
-            if cur and not cur.endswith("\n"):
-                urlbox.insert("end", "\n")
-            urlbox.insert("end", "\n".join(new) + "\n")
-            urlbox.see("end")
             checker.trust(new)
         log("Added %d link(s) from the browser%s" % (len(new), (" (%d already in the list)" % (len(links) - len(new))) if len(links) > len(new) else ""))
 
     def clear_urls():
-        urlbox.delete("1.0", "end")
+        if table["rows"]:
+            push_undo()
+            table["rows"] = []
+            table["state"].clear()
+            render_table(False)
+            on_select()
 
     def copy_log():
         root.clipboard_clear()
@@ -4707,31 +5316,60 @@ def main_gui():
         tips.append((cmb_ex, "What to do with a model or image that was downloaded before. Ask: a window asks every time (default). "
                              "Skip: it is passed by. Download again: it is downloaded again and overwritten."))
 
-        ttk.Label(dl, text="Description file:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(dl, text="If examples or gallery fail:").grid(row=1, column=0, sticky="w", pady=4)
+        row_p = ttk.Frame(dl)
+        row_p.grid(row=1, column=1, sticky="w", padx=(10, 0), pady=4)
+        cmb_pa = ttk.Combobox(row_p, textvariable=partial_var, values=[lbl for lbl, _c in PARTIAL_LABELS], state="readonly", width=16)
+        cmb_pa.pack(side="left")
+        ttk.Label(row_p, text="  Notify:").pack(side="left")
+        cmb_no = ttk.Combobox(row_p, textvariable=notice_var, values=[lbl for lbl, _c in NOTICE_LABELS], state="readonly", width=20)
+        cmb_no.pack(side="left", padx=(6, 0))
+
+        def sync_notice(*_):  # a question cannot be left unasked: "Don't notify" is only for Keep in queue / Finish
+            vals = [lbl for lbl, _c in NOTICE_LABELS]
+            if partial_var.get() == "Ask":
+                vals = vals[:2]
+                if notice_var.get() not in vals:
+                    notice_var.set(vals[0])
+            cmb_no.configure(values=vals)
+        cmb_pa.bind("<<ComboboxSelected>>", sync_notice, "+")
+        sync_notice()
+        tips.append((cmb_pa, "A model was downloaded but some of its example or gallery images were not (the log shows which). Ask: you decide for those models "
+                             "(finish as it is, or keep them in the list with the Model file switched off, so the next run completes only the images). "
+                             "Keep in queue / Finish: it is done without asking."))
+        tips.append((cmb_no, "When to tell you about such models: after each job, or once at the end of the list. Don't notify is possible only for "
+                             "Keep in queue and Finish (the log always has the details)."))
+
+        ttk.Label(dl, text="Description file:").grid(row=2, column=0, sticky="w", pady=4)
         row_d = ttk.Frame(dl)
-        row_d.grid(row=1, column=1, sticky="we", padx=(10, 0), pady=4)
+        row_d.grid(row=2, column=1, sticky="we", padx=(10, 0), pady=4)
         e_dscr = ttk.Entry(row_d, textvariable=v["DSCR"], width=16)
         e_dscr.pack(side="left", fill="x", expand=True, ipady=2)
         cb_dname = ttk.Checkbutton(row_d, text="Name as model", variable=b["DSCR_AS_MODEL"])
         cb_dname.pack(side="left", padx=(10, 0))
 
         cb_sub = ttk.Checkbutton(dl, text="Image subfolder:", variable=b["USE_SUBFOLDER"])
-        cb_sub.grid(row=2, column=0, sticky="w", pady=4)
+        cb_sub.grid(row=3, column=0, sticky="w", pady=4)
         e_img = ttk.Combobox(dl, textvariable=v["IMGFOLDER"], width=30, values=recent["IMGFOLDER"])
-        e_img.grid(row=2, column=1, sticky="we", padx=(10, 0), pady=4, ipady=2)
+        e_img.grid(row=3, column=1, sticky="we", padx=(10, 0), pady=4, ipady=2)
         combos["IMGFOLDER"] = e_img
         for ent, key in ((e_dscr, "DSCR"), (e_img, "IMGFOLDER")):
             UndoEntry(ent, v[key])
             attach_menu(ent)
         setup_w.update(e_dscr=e_dscr, e_img=e_img)
 
-        cb_video = ttk.Checkbutton(dl, text="Include videos", variable=b["VIDEO"])
-        cb_orig = ttk.Checkbutton(dl, text="Original file names", variable=b["ORIGINAL"])
-        cb_webp = ttk.Checkbutton(dl, text="Convert WebP to JPG", variable=b["WEBP2JPG"], command=on_webp)
+        row_o = ttk.Frame(dl)
+        row_o.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 3))
+        cb_video = ttk.Checkbutton(row_o, text="Include videos", variable=b["VIDEO"])
+        cb_orig = ttk.Checkbutton(row_o, text="Original file names", variable=b["ORIGINAL"])
+        cb_webp = ttk.Checkbutton(row_o, text="Convert WebP to JPG", variable=b["WEBP2JPG"], command=on_webp)
+        cb_video.pack(side="left")
+        cb_orig.pack(side="left", padx=(16, 0))
+        cb_webp.pack(side="left", padx=(16, 0))
         cb_rename = ttk.Checkbutton(dl, text="Name ID-like model files by title", variable=b["RENAME_ID"])
         cb_comfy = ttk.Checkbutton(dl, text="Save ComfyUI workflow as .json (experimental)", variable=b["COMFY"])
-        for r, w in enumerate((cb_video, cb_orig, cb_webp, cb_rename, cb_comfy), start=3):
-            w.grid(row=r, column=0, columnspan=2, sticky="w", pady=(8 if r == 3 else 3, 3))
+        for r, w in enumerate((cb_rename, cb_comfy), start=5):
+            w.grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
         tips.append((cb_comfy, "Experimental: if the image metadata holds a ComfyUI workflow, it is saved as a .json next to the image."))
 
         ttk.Label(con, text="API token:").grid(row=0, column=0, sticky="w", pady=4)
@@ -4776,8 +5414,19 @@ def main_gui():
         cb_dark = ttk.Checkbutton(gen, text="Dark theme", variable=b["DARK"],
                                   command=lambda: (apply_theme(bool(b["DARK"].get())), save_settings()))
         cb_dark.grid(row=1, column=0, columnspan=2, sticky="w", pady=(12, 4))
+        row_c = ttk.Frame(gen)
+        row_c.grid(row=2, column=0, columnspan=2, sticky="we", pady=4)
+        ttk.Label(row_c, text="Table columns:").pack(side="left")
+
+        def on_columns():
+            apply_columns()
+            save_settings()
+        cb_cp = ttk.Checkbutton(row_c, text="Examples", variable=b["COL_PICS"], command=on_columns)
+        cb_cg = ttk.Checkbutton(row_c, text="Gallery", variable=b["COL_GALLERY"], command=on_columns)
+        cb_cp.pack(side="left", padx=(10, 0))
+        cb_cg.pack(side="left", padx=(10, 0))
         row_u = ttk.Frame(gen)
-        row_u.grid(row=2, column=0, columnspan=2, sticky="we", pady=4)
+        row_u.grid(row=3, column=0, columnspan=2, sticky="we", pady=4)
         cb_upd = ttk.Checkbutton(row_u, text="Check for updates on start", variable=b["CHECK_UPDATES"])
         cb_upd.pack(side="left")
 
@@ -4798,7 +5447,7 @@ def main_gui():
         ttk.Label(row_u, textvariable=upd_status).pack(side="left", padx=(10, 0))
         if title_plan() == "system":  # Windows 10 paints active title bars with the accent colour: say so, offer the setting
             row_h = ttk.Frame(gen)
-            row_h.grid(row=3, column=0, columnspan=2, sticky="we", pady=(14, 2))
+            row_h.grid(row=4, column=0, columnspan=2, sticky="we", pady=(14, 2))
             ttk.Label(row_h, wraplength=520, justify="left",
                       text="Windows 10 paints the title bar of the active window with the accent colour (Windows Settings > Personalization "
                            "> Colors > \"Title bars and window borders\"), so title bars stay light with the dark theme. Turn that "
@@ -4810,6 +5459,10 @@ def main_gui():
                 except OSError:
                     pass
             ttk.Button(row_h, text="Open Windows color settings", command=open_colors).pack(anchor="w", pady=(6, 0))
+        tips.append((cb_cp, "Show the Examples column in the link table. Hidden columns give their room to the Link and Folder columns; "
+                            "the values stay in the rows and the fields above the table still work."))
+        tips.append((cb_cg, "Show the Gallery column in the link table. Hidden columns give their room to the Link and Folder columns; "
+                            "the values stay in the rows and the fields above the table still work."))
         tips.append((cb_dark, "Dark colours for the whole program. Windows system message boxes stay light."))
         tips.append((cb_upd, "At start (not more than once in 12 hours) the program asks github.com which release is the newest "
                              "and shows a link at the top if it is newer than this one. Nothing is downloaded or installed by itself."))
@@ -4988,11 +5641,12 @@ def main_gui():
         root.after(600, lambda: tb["prog"].attach(root))
 
     def remove_line(u):
-        """Remove the first line of the link list that equals u (a finished link)."""
-        for i, ln in enumerate(urlbox.get("1.0", "end-1c").splitlines(), 1):
-            if ln.strip() == u.strip():
-                urlbox.delete("%d.0" % i, "%d.0 lineend+1c" % i)
-                urlbox.edit_reset()
+        """Remove the first row of the table whose link is u (a finished link); what could be undone before is forgotten."""
+        for r in table["rows"]:
+            if r.url.strip() == u.strip():
+                remove_rows([r], remember=False)
+                table["undo"].clear()
+                table["redo"].clear()
                 return
 
     def ask(msg):
@@ -5217,9 +5871,24 @@ def main_gui():
                 box.configure(state="disabled")
         except queue.Empty:
             pass
+        notices = []
         try:
             while True:
-                u_done = done_q.get_nowait()
+                u_job, st_job = job_q.get_nowait()
+                if st_job.startswith("notice:"):
+                    notices.append(st_job[7:])
+                elif st_job == "keep":
+                    keep_for_later(u_job)
+                else:
+                    table["state"][u_job] = st_job
+        except queue.Empty:
+            pass
+        for text_ in notices:
+            messagebox.showinfo("Civitai Grabber", text_)
+        try:
+            while True:
+                u_done, folder_done = done_q.get_nowait()
+                freeze_held_children(u_done, folder_done)  # an image on hold keeps the folder of its finished model
                 remove_line(u_done)
                 note = ATTENTION.pop(u_done, None)
                 if note:
@@ -5252,14 +5921,14 @@ def main_gui():
         rows = checker.tick(current_links(), active_token(), collect_cfg)
         if rows:
             handle_problems(rows)
+        refresh_dynamic()
         t = state["thread"]
         if t is not None and not t.is_alive():
             state["thread"] = None
             tb_finish()
-            start_btn.configure(state="normal")
-            stop_btn.configure(state="disabled")
+            start_btn.set_mode("start")
         if state["thread"] is None:
-            waiting = checker.unsettled(current_links())
+            waiting = checker.unsettled(active_links())
             want = "disabled" if waiting else "normal"
             if str(start_btn.cget("state")) != want:
                 start_btn.configure(state=want)
@@ -5287,7 +5956,7 @@ def main_gui():
                 err = register_launcher()
                 log("Launch from the browser allowed." if not err else "Could not write the registry entry: %s" % err)
             save_settings()
-        want = "normal" if (b["BRIDGE"].get() and BRIDGE.connected()) else "disabled"
+        want = "normal" if (b["BRIDGE"].get() and BRIDGE.connected() and not ui_state["only_img"]) else "disabled"
         if gal_state["s"] != want:
             gal_state["s"] = want
             e_gal.configure(state=want)
@@ -5323,11 +5992,11 @@ def main_gui():
                                    "that runs this script:\n%s\n\nInstall it now (pip install pillow)?" % python_for_pip()):
                 threading.Thread(target=install_pillow, daemon=True).start()
 
-    def worker(cfg, urls, need_pillow=False):
+    def worker(jobs, cfg, need_pillow=False):
         try:
             if need_pillow:
                 install_pillow()
-            run_task(cfg, urls, log, stop, ask, done_q.put)
+            run_jobs(jobs, log, stop, ask, lambda u: done_q.put((u, STATE.get("model_folder"))), fallback_cfg=cfg, on_job=lambda u, st: job_q.put((u, st)))
         except Exception as ex:  # noqa
             log("Critical error: %s" % ex)
             file_log(traceback.format_exc())
@@ -5349,7 +6018,16 @@ def main_gui():
             d = collect_cfg()
             d["TOKEN"] = v["TOKEN"].get().strip()  # the saved token stays even while "Connect via API" is off
             d["UPDATE_LAST"], d["UPDATE_FOUND"], d["UPDATE_URL"] = upd["last"], upd["found"], upd["url"]
-            d["URLS"] = urlbox.get("1.0", "end").strip()
+            d["URLS"] = "\n".join(current_links())  # (older versions read the links from here)
+            rows_ = []
+            for r in table["rows"]:
+                ov_ = dict(r.ov)
+                last_ = table["state"].get(r.url)
+                if last_ in ("error", "partial") and ov_.get("HOLD") != "1":  # after a restart it is history: on hold until the user decides
+                    ov_["HOLD"], ov_["WAS"] = "1", last_
+                rows_.append({"url": r.url, "ov": ov_})
+            d["ROWS"] = rows_
+            d["ROWS_VERSION"] = 2
             d["LAUNCH_ASKED"] = launch_state["asked"]
             d["RECENT"] = list(recent["PATH"])
             d["RECENT_PREFIX"] = list(recent["PREFIX"])
@@ -5364,9 +6042,11 @@ def main_gui():
 
     def start():
         cfg = collect_cfg()
-        urls = current_links()
+        parent = layout()[0]
+        active = [r for r in table["rows"] if not is_held(r, parent)]
+        urls = [r.url for r in active]
         if not urls:
-            log("The link list is empty.")
+            log("All links are on hold - select the ones to start, press Resume, then START." if table["rows"] else "The link list is empty.")
             return
         if checker.unsettled(urls):
             log("The link check is still running - START works when it is done.")
@@ -5383,17 +6063,22 @@ def main_gui():
             if not messagebox.askyesno("Civitai Grabber", "The description file name is empty: no description and no "
                                                           "generation metadata will be written.\n\nContinue anyway?"):
                 return
-        n_models = sum(1 for u in urls if re.search(r"/models/\d+", u))
-        if not flag(cfg, "MODEL") and n_models:
+        off = [r for r in active if re.search(r"/models/\d+", r.url) and effective(r, parent)["MODEL"] != "1" and not r.ov.get("MODELDONE")]
+        if off:
             ans = messagebox.askyesnocancel(
                 "Civitai Grabber",
                 "The \"Model file\" option is OFF.\n\n%d link(s) in the list lead to models: only their examples and "
                 "description will be downloaded, without the model files.\n\n"
-                "Yes - turn \"Model file\" ON and start\nNo - start without model files\nCancel - go back" % n_models)
+                "Yes - turn \"Model file\" ON and start\nNo - start without model files\nCancel - go back" % len(off))
             if ans is None:
                 return
             if ans:
-                b["MODEL"].set(True)
+                defaults["MODEL"] = "1"
+                for r in active:
+                    if r.ov.get("MODEL") == "0":
+                        r.ov["MODEL"] = "1"
+                load_fields()
+                refresh_dynamic()
                 cfg = collect_cfg()
         need_pillow = False
         if cfg["WEBP2JPG"] == "1":
@@ -5403,20 +6088,79 @@ def main_gui():
                 need_pillow = messagebox.askyesno(
                     "Civitai Grabber", "WebP to JPG conversion needs the Pillow library, which is not installed for the "
                                        "Python that runs this script:\n%s\n\nInstall it now (pip install pillow)?" % python_for_pip())
+        jobs = make_jobs(urls, cfg)  # the parent of an image is found in the same order as in the table (held rows go with their model)
+        for job, r in zip(jobs, active):
+            e = effective(r, parent)
+            if r.id in parent:  # an image under a model: the folder of the model, or a folder of its own
+                job.cfg["PATH"] = e["PATH"]
+                if "PATH" in r.ov:
+                    job.cfg["OWN_FOLDER"] = "1"
+            else:
+                job.cfg.update({k: e[k] for k in ROW_KEYS})  # every job takes the values of its own row
+                if r.ov.get("DIR"):
+                    job.cfg["DIR"] = r.ov["DIR"]
+        held_n = len(table["rows"]) - len(active)
+        if held_n:
+            log("%d link(s) on hold are skipped." % held_n)
         for key in ("PATH", "PREFIX", "IMGFOLDER"):
             push_recent(key, cfg[key])
+        for r in active:
+            e = effective(r, parent)
+            for key in ("PATH", "PREFIX"):
+                if e.get(key):
+                    push_recent(key, e[key])
+        table["state"].clear()
         save_settings()
         stop.clear()
-        start_btn.configure(state="disabled")
-        stop_btn.configure(state="normal")
-        t = threading.Thread(target=worker, args=(cfg, urls, need_pillow), daemon=True)
+        start_btn.set_mode("stop")
+        start_ctx["t0"] = time.time()
+        t = threading.Thread(target=worker, args=(jobs, cfg, need_pillow), daemon=True)
         state["thread"] = t
         t.start()
 
     def do_stop():
         stop.set()
+        start_btn.set_mode("stopping")
         log("Stopping after the current step…")
 
+    def main_button():  # one button: START, then STOP (a double click on START must not stop the task at once)
+        if start_btn.mode == "start":
+            start()
+        elif start_btn.mode == "stop" and time.time() - start_ctx.get("t0", 0) > 1.0:
+            do_stop()
+
+    tmenu = tk.Menu(root, tearoff=0)
+    tmenu.add_command(label="Paste links", command=lambda: paste_urls())
+    tmenu.add_command(label="Select all", command=select_all)
+    tmenu.add_command(label="Copy link", command=copy_links)
+    tmenu.add_separator()
+    tmenu.add_command(label="Hold", command=hold_toggle)
+    tmenu.add_command(label="Remove", command=remove_selected)
+
+    def table_menu(e):
+        iid = tree.identify_row(e.y)
+        if iid and iid not in tree.selection():
+            tree.selection_set(iid)
+        tmenu.entryconfigure(4, label=hold_label())
+        tmenu.tk_popup(e.x_root, e.y_root)
+
+    def table_click(e):  # a click on the empty part of the table deselects
+        if tree.identify_row(e.y) == "" and tree.identify_region(e.x, e.y) != "heading":
+            clear_selection()
+
+    def table_ctrl(e):  # Ctrl+letter, whatever the keyboard layout is (on Windows the key code is the letter's code)
+        code = e.keycode if sys.platform == "win32" else {"a": 65, "v": 86, "z": 90, "y": 89, "c": 67}.get(str(e.keysym).lower(), 0)
+        action = {65: select_all, 86: lambda: paste_urls(), 90: undo_rows, 89: redo_rows, 67: copy_links}.get(code)
+        if action:
+            action()
+            return "break"
+
+    tree.bind("<Button-3>", table_menu)
+    tree.bind("<Button-1>", table_click, "+")
+    tree.bind("<Delete>", remove_selected)
+    tree.bind("<Escape>", clear_selection)
+    tree.bind("<Double-1>", lambda e: open_row() if tree.identify_row(e.y) else None)
+    tree.bind("<Control-KeyPress>", table_ctrl)
     cb_signin.configure(command=on_signin_click)
     refresh_signin_ui()
 
@@ -5427,14 +6171,14 @@ def main_gui():
     cb_api.configure(command=on_api)
     sample_btn.configure(command=create_sample)
     load_btn.configure(command=load_txt)
-    start_btn.configure(command=start)
-    stop_btn.configure(command=do_stop)
+    start_btn.configure(command=main_button)
     copylog_btn.configure(command=copy_log)
     openlog_btn.configure(command=open_log)
     paste_btn.configure(command=paste_urls)
     undo_btn.configure(command=do_undo)
     redo_btn.configure(command=do_redo)
     clear_btn.configure(command=clear_urls)
+    hold_btn.configure(command=hold_toggle)
     help_btn.configure(command=show_help)
     setup_btn.configure(command=open_setup)
     cb_bridge.configure(command=set_bridge)
@@ -5449,8 +6193,23 @@ def main_gui():
     if b["DARK"].get():
         apply_theme(True)
     root.after(4000, auto_update_check)
-    urlbox.insert("1.0", saved.get("URLS", ""))
-    urlbox.edit_reset()
+    push_defaults()
+    saved_rows = saved.get("ROWS")
+    if isinstance(saved_rows, list):
+        for item in saved_rows:
+            if isinstance(item, dict) and str(item.get("url", "")).lower().startswith("http"):
+                table["rows"].append(new_row(str(item["url"]).strip(), item.get("ov") if isinstance(item.get("ov"), dict) else {}))
+    else:
+        table["rows"] = [new_row(u) for u in extract_urls(saved.get("URLS", ""))]
+    migrate_rows()
+    style_table(bool(b["DARK"].get()))
+    apply_columns()
+    render_table(False)
+    tree.bind("<Configure>", on_tree_resize, "+")
+    tree.bind("<ButtonRelease-1>", on_tree_resize, "+")
+    tree.bind("<<TreeviewSelect>>", on_select)
+    for key_ in ROW_KEYS:
+        (b[key_] if key_ == "MODEL" else v[key_]).trace_add("write", lambda *_a, k=key_: on_field_change(k))
     if isinstance(saved.get("PREFIX_BY_PATH"), dict):
         prefix_map.update({str(k): str(x) for k, x in saved["PREFIX_BY_PATH"].items()})
     refresh_link()
