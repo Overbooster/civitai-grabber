@@ -13,7 +13,7 @@ Made first of all for the author's own workflow and shared as-is: you are welcom
 **Status: public beta.** The latest version is on the [Releases](../../releases) page. It works for the author,
 but it has been tested on very few machines. Bug reports are welcome (see below).
 
-<img width="738" height="729" alt="Civitai Grabber 047" src="https://github.com/user-attachments/assets/6d094b42-576b-4576-b16d-8df91d53c751" />
+<img width="767" height="729" alt="Civitai Grabber 051_1" src="https://github.com/user-attachments/assets/d24fdc2a-5794-4efd-927c-0e6cc57e766c" />
 
 
 ## What you need
@@ -32,12 +32,38 @@ but it has been tested on very few machines. Bug reports are welcome (see below)
   log next to itself.
 2. Double-click `civitai_grabber.pyw`. Tick **Connect via Sign-in** and allow the access in the browser tab
   (or click the gear button, open the tab *Connection*, paste an API token and tick **Connect via API**).
-  Choose the output folder, paste Civitai links
-  (model pages, `.../models/ID?modelVersionId=ID`, or single image pages `.../images/ID`) and press **START**.
-3. For each model you get the file, `NN-example` images/videos with metadata, and the description file.
+3. Choose the output folder, paste Civitai links (model pages, `.../models/ID?modelVersionId=ID`, or single image
+  pages `.../images/ID`) and press **START**.
+4. For each model you get the file, `NN-example` images/videos with metadata, and the description file.
 
 The window has tooltips for every option. Rarely changed options are in **Setup** (the gear button at the top
 right). Settings can also be given in a plain text task file (see the comment at the top of `civitai_grabber.pyw`).
+
+## The link table: every link is a job of its own
+
+Each link you add becomes a row of the table, and **a row keeps its own settings**: output folder, prefix, number
+of examples, number of gallery images and the *Model file* switch. When a link is added, it takes the values that the
+fields above the table show at that moment. Change the fields later and only the links added *afterwards* are
+affected, so you can paste a few links, set another folder and prefix, paste more, and press **START** once.
+
+- **To change links that are already in the table**, select them (Ctrl or Shift for several): the header says
+  *settings for: N selected*, and the fields above now show and change those rows only.
+- The **Status** column shows what happens to each link: *checking*, *ok*, *warning*, *running*, *done*, *error*,
+  *partial* (the model came, but some of the images did not), *hold*. Models are shown by name, not by address.
+- A model and the single image links below it form a **pack** and share one colour (the colours alternate between
+  packs; a lone link has no colour). The images of a pack **follow the folder of their model**. An image that you
+  give a folder of its own is marked with *.
+- **Hold** pauses the selected rows: **START** skips them until you press **Resume**. A model on hold holds its
+  images too. Rows that ended with an error or *partial* come back after a restart marked *hold (error)* /
+  *hold (partial)*, so a failed link is never started again by accident.
+- Finished links disappear from the table, failed ones stay. **Undo / Redo** take back changes of the list. The table
+  is remembered between runs.
+- **START** and **STOP** are one button: STOP appears while a task runs.
+- Setup lets you hide the *Examples* and *Gallery* columns to give more room to the others.
+
+If a model is downloaded but some example or gallery images fail, Setup (tab *Downloads*) decides what happens: you
+are asked, or the model is kept in the list with *Model file* switched off so the next run completes only the images,
+or it is simply finished.
 
 ## What the program checks when you add a link
 
@@ -52,31 +78,29 @@ Civitai about it and shows a window if something is wrong:
 
 For each warning you remove the link or keep it (for an existing folder the buttons are "Exclude link" and
 "Download to new folder": the model is then saved to a separate folder named *Name (model id)*). **START** stays
-locked until all checks are done and all warnings are answered; a link you kept because of a paid or missing model is
-checked again when you press START. If Civitai cannot be reached, the link simply stays in the list. Free models get no
-extra requests; for paid and early-access models the program sends one tiny test request to the file address to see
-whether your account already has the access. Nothing is created on disk for a model that cannot be downloaded. The
-taskbar button turns yellow while some link in the list carries a warning.
+locked until all checks are done and all warnings are answered. If Civitai cannot be reached, the link simply stays in
+the list. Free models get no extra requests; for paid and early-access models the program sends one tiny test request
+to the file address to see whether your account already has the access. Nothing is created on disk for a model that
+cannot be downloaded. The taskbar button turns yellow while some link in the list carries a warning.
 
-## Setup, appearance and keyboard
+## Setup and appearance
 
 - **Setup** (the gear button, top right) has three tabs. *Downloads*: what to do with already downloaded items (ask,
-  skip, download again), the description file name (and *Name as model*), the image subfolder, videos, original file
-  names, WebP to JPG, naming of ID-like model files, and the experimental ComfyUI workflow `.json`. *Connection*: the API
-  token (the key is shown while the field is unlocked and hidden when you press *Lock*). *Program*: how many recent
-  folders and prefixes the lists remember (5 to 30), the dark theme and the update check.
+  skip, download again), what to do when some example or gallery images fail, the description file name (and *Name as
+  model*), the image subfolder, videos, original file names, WebP to JPG, naming of ID-like model files, and the
+  experimental ComfyUI workflow `.json`. *Connection*: the API token (the key is shown while the field is unlocked and
+  hidden when you press *Lock*). *Program*: how many recent folders and prefixes the lists remember (5 to 30), which
+  table columns are shown, the dark theme and the update check.
 - **Three check boxes** at the top show and switch the connections: *Connect via Sign-in*, *Connect via API* and
   *Browser bridge*. Hover a box for details (who is signed in, whether a token is entered, whether the browser extension
-  is connected). If the bridge cannot start because its ports are busy, the box says so.
-- **Dark theme** (Setup, tab *Program*). On Windows 10 the title bar of the active window follows the system setting
-  *Show accent color on title bars and window borders*: while it is on, Windows paints that title bar with the accent
-  color whatever the program asks for. Turn it off in Windows Settings -> Personalization -> Colors to get dark title bars
-  (Setup has a button for it). On Windows 11 the program sets the title bar colors itself.
-- **Keyboard.** Tab and Shift+Tab go through the controls in the order of the screen and leave the text boxes (no tab
-  characters are typed), Enter presses the focused button, Space ticks a box.
+  is connected).
+- **Dark theme.** On Windows 10 the title bar of the active window follows the system setting *Show accent color on
+  title bars and window borders*: while it is on, Windows paints that title bar with the accent color whatever the
+  program asks for. Turn it off in Windows Settings -> Personalization -> Colors to get dark title bars (Setup has a
+  button for it). On Windows 11 the program sets the title bar colors itself.
 - **Updates.** When the program starts (at most once in 12 hours) it asks github.com which release is the newest and shows
   an *Update X* link at the top right if it is newer than the one you run. Nothing is downloaded or installed by the
-  program. Switch it off with *Check for updates on start* in Setup, tab *Program*.
+  program. Switch it off in Setup, tab *Program*.
 - **Failure diagnostics.** When a request fails, the log gets a line like `DIAG: reset | files | ... | ...`: the kind of
   failure, the part of the service (`api`, `page` or `files`), the facts and a conclusion - whether it looks like your
   internet connection, a short outage of the file servers, rate limits, a Cloudflare check page, or a change in Civitai
@@ -97,6 +121,23 @@ taskbar button turns yellow while some link in the list carries a warning.
   lies in the same folder is never overwritten; if the folder name is taken by another model, the new model gets its
   own folder named *Name (model id)*.
 
+## How the downloads are organised
+
+- **A model link** creates the model's own folder inside the row's output folder. It receives the model file, the
+  example images/videos (`01-...`, `02-...`) with their metadata, and the description file. *Model file* can be
+  switched off per row to get only the images and the description.
+- **Gallery images** are the images other users uploaded to the model's gallery: the *Gallery* field says how many
+  to take (a number or *all*; it needs the browser bridge).
+- **Single image links** (`.../images/ID`) added right after a model link are downloaded into that model's folder
+  together with its examples: the numbering simply continues, and their metadata is appended to the description file.
+- **Images without a model link before them** go to the folder of their own row (optionally into an image subfolder,
+  see Setup).
+- If a model was downloaded before, the program asks what to do (skip it, or download it again; Setup can set the
+  answer once for all).
+- Folders the program created and that stayed empty (a failed run, a stop) are removed without asking. If a run is
+  stopped or a download fails halfway, the program offers to delete the incomplete files (nothing else is ever
+  touched). An incomplete file is resumed when you download the same link again.
+
 ## Two ways to authorize
 
 The program needs your Civitai account for some models and for reading image pages. There are two ways, and both can be set up at the same time:
@@ -106,12 +147,11 @@ The program needs your Civitai account for some models and for reading image pag
 | How | Tick *Connect via Sign-in* and allow the access in the browser tab | Create a key in Civitai (account settings -> API keys), paste it in Setup (gear button), tab *Connection*, and tick *Connect via API* |
 | Access | Read-only (profile, models, media), limited to this program | A personal key: treat it like a password |
 | Revoking | One click in your Civitai account (*Connected Apps*) | Delete the key in Civitai |
-| Renewal | Automatic (the access is renewed in the background every hour) | Not needed |
+| Renewal | Automatic (renewed in the background every hour) | Not needed |
 | Stored in | `civitai_grabber_auth.json` | `civitai_grabber_settings.json` |
-| Log of a run | Does not show your user name | Does not show your user name |
 | Needs | A browser and the local port 8765 free for a moment | Nothing |
 
-**Which one is used?** If you are signed in, the sign-in is used and the API token is ignored; after you sign out, the token is used again. The log of every run says which credentials were used and counts the requests (for example "Credentials used: OAuth 120 request(s), API token 0"), and lists any request that was refused although you were signed in. `civitai.red` and `civitai.com` are interchangeable: a sign-in on either site works for links of both.
+**Which one is used?** If you are signed in, the sign-in is used and the API token is ignored; after you sign out, the token is used again. The log of every run says which credentials were used and counts the requests, but never shows your user name. `civitai.red` and `civitai.com` are interchangeable: a sign-in on either site works for links of both.
 
 ## Privacy
 
@@ -124,28 +164,10 @@ to 1.1.1.1 or 8.8.8.8 and one simple request to the Civitai site, to tell your i
 neither sends any data about you. The browser extension talks only to the program on your own computer (127.0.0.1) and
 works with the Civitai pages in your browser.
 
-## How the downloads are organised
-
-- **A model link** creates the model's own folder inside the output folder. It receives the model file, the
-  example images/videos (`01-...`, `02-...`) with their metadata, and the description file.
-- **Gallery images** (links to single image pages, `.../images/ID`) that are added to the list right after a
-  model link are downloaded into that model's folder together with its examples: they inherit the folder, the
-  numbering simply continues, and their metadata is appended to the description file.
-- **Images without a model link before them** go to the output folder itself (optionally into an
-  image subfolder, see the option in Setup). So to download gallery images separately, set the folder you
-  want before pressing **START**.
-- If a model was downloaded before, the program asks what to do (skip it, or download it again; Setup can set the
-  answer once for all).
-- At the moment the output folder and the other options apply to the whole current list; per-link folders are
-  planned.
-- Folders the program created and that stayed empty (a failed run, a stop) are removed without asking. If a run is
-  stopped or a download fails halfway, the program offers to delete the incomplete files (nothing else is ever
-  touched). An incomplete file is resumed when you download the same link again.
-
 ## Browser bridge (optional, recommended)
 
-Civitai image pages cannot be read by scripts without your browser session, so some metadata can only be
-collected through your browser. The bridge does this reading with your own login. To add pages to the list it
+Civitai image pages cannot be read by scripts without your browser session, so some metadata and the gallery images can
+only be collected through your browser. The bridge does this reading with your own login. To add pages to the list it
 provides:
 
 - the right-click items "Add link to Civitai Grabber list" and "Add this page to Civitai Grabber list";
@@ -162,9 +184,9 @@ list; when you remove such a link in the program, it disappears from that list t
 and the signed `.xpi` 0.17.0 (the same code; only the Firefox manifest differs).
 
 - **Firefox 140 or newer (desktop), recommended:** install it from the Firefox Add-ons site:
-  [Civitai Grabber Bridge](https://addons.mozilla.org/en-US/firefox/addon/civitai-grabber-bridge/) -> *Add to Firefox*.
+  [Civitai Grabber Bridge](https://addons.mozilla.org/firefox/addon/civitai-grabber-bridge/) -> *Add to Firefox*.
   Firefox then updates it by itself.
-- **Firefox, the other way**: open the latest Release and click the signed `.xpi`
+- **Firefox, the other way:** open the latest Release and click the signed `.xpi`
   file in the Assets list; Firefox asks whether to install it - confirm with *Add*. It is signed by Mozilla, so it stays
   installed after Firefox is restarted, and Firefox updates it by itself (it checks once a day, or use `about:addons` -> gear
   icon -> *Check for Updates*). Please install it this way: an add-on installed through *Install Add-on From File* did not
