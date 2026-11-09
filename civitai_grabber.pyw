@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Civitai Grabber v0.51 - batch downloader for Civitai LoRA models and their example
+Civitai Grabber v0.52 - batch downloader for Civitai LoRA models and their example
 images/videos with generation metadata. Python 3.8+, standard library only
 (Tkinter is included in the Windows installer from python.org).
 
-Run with a window:   python civitai_grabber_v0.51.pyw
-Run without window:  python civitai_grabber_v0.51.pyw task.txt
+Run with a window:   python civitai_grabber.pyw
+Run without window:  python civitai_grabber.pyw task.txt
 
 Settings can be entered in the window or given in a txt task file:
     TOKEN: your_api_token
@@ -61,7 +61,7 @@ import secrets
 import webbrowser
 from html.parser import HTMLParser
 
-VERSION = "0.51"
+VERSION = "0.52"
 
 # ======================================================================================================
 # SWITCHES - change True/False here, nothing else needs editing
@@ -92,7 +92,7 @@ STATE = {"log": None, "bridge_failures": 0, "bridge_off": False, "stop": None, "
 DEFAULTS = {"BRIDGE": "1", "TOKEN": "", "PATH": "", "PREFIX": "", "PICS": "4", "VIDEO": "1", "ORIGINAL": "1",
             "COMFY": "0", "EXISTING": "ask", "IMGFOLDER": "", "USE_SUBFOLDER": "0", "DSCR": "dscr.txt", "DSCR_AS_MODEL": "0", "MODEL": "1", "GALLERY": "0",
             "WEBP2JPG": "0", "RENAME_ID": "0", "USE_API": "0", "DARK": "0", "CHECK_UPDATES": "1", "COL_PICS": "1", "COL_GALLERY": "1",
-            "ON_PARTIAL": "ask", "PARTIAL_NOTICE": "each"}
+            "ON_PARTIAL": "ask", "PARTIAL_NOTICE": "each", "BRIDGE_DARK": "0"}
 
 
 SECRETS = set()  # strings (the API token) that must never appear in a log
@@ -1132,7 +1132,7 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/ping":
             BRIDGE.last_poll = time.time()
-            self._send(200, json.dumps({"app": "civitai-grabber", "version": VERSION, "launcher": BRIDGE.launcher}).encode())
+            self._send(200, json.dumps({"app": "civitai-grabber", "version": VERSION, "launcher": BRIDGE.launcher, "dark": BRIDGE.dark}).encode())
         elif path == "/job":
             BRIDGE.last_poll = time.time()
             cid = (urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("c") or [""])[0][:64]
@@ -1222,6 +1222,7 @@ class Bridge:
         self.next_id = 1
         self.taken = {}  # job id -> time it was handed to a browser
         self.launcher = False  # is the launch entry registered (reported to the extension)
+        self.dark = False  # the extension window is drawn dark (a setting of its own; told to the extension in the ping answer)
         self.added = queue.Queue()  # links sent from the browser
         self.owner = {}  # "models/123" -> id of the browser that added the link (its news goes back to it)
         self.events = {}  # browser id -> queue of news for that browser
@@ -1610,7 +1611,9 @@ def access_state(ver, token, url=""):
         file_log("access check %s: %s" % (url or dl, res["probe"]))
         # allowed = the file itself, or a redirect to file storage (an absolute address outside Civitai).
         # A redirect to a Civitai page (/model-versions/ID, a login or purchase page) means "no access".
-        to_storage = code in (301, 302, 303, 307, 308) and loc.lower().startswith(("http://", "https://")) and not site_of(loc)
+        page_hosts = ("civitai.com", "www.civitai.com", "civitai.red", "www.civitai.red")  # Civitai pages; b2.civitai.com and the like are storage
+        to_storage = (code in (301, 302, 303, 307, 308) and loc.lower().startswith(("http://", "https://"))
+                      and (urllib.parse.urlsplit(loc).hostname or "").lower() not in page_hosts)
         if code in (200, 206) or to_storage:
             res.update(kind="ok", text="Paid, but this account has access (a test request to the file address was accepted).")
         elif code not in (301, 302, 303, 307, 308, 401, 402, 403):
@@ -1658,6 +1661,7 @@ def check_availability(url, apikey):
         return out
 
     out["name"] = out["name"] or (ver.get("model") or {}).get("name") or ""
+    out["mtype"] = str((ver.get("model") or {}).get("type") or "")
     out["ver"] = ver.get("name") or ""
     out["vid"] = ver.get("id") or vid
     vfiles = ver.get("files") or []
@@ -1671,6 +1675,21 @@ def check_availability(url, apikey):
     out["kind"] = "ok"
     out.update(access_state(ver, token, url))
     return out
+
+
+MODEL_TYPE_NAMES = {"lora": "LoRA", "locon": "LyCORIS", "dora": "DoRA", "textualinversion": "Embedding", "aestheticgradient": "Aesthetic",
+                    "motionmodule": "Motion", "controlnet": "Controlnet", "checkpoint": "Checkpoint", "hypernetwork": "Hypernetwork",
+                    "vae": "VAE", "upscaler": "Upscaler", "poses": "Poses", "wildcards": "Wildcards", "workflows": "Workflows",
+                    "detection": "Detection", "other": "Other", "textencoder": "Text Encoder", "unet": "UNet", "clipvision": "CLIP Vision",
+                    "comfyuiworkflows": "ComfyUI WF", "vlm": "VLM", "clip": "CLIP", "llm": "LLM"}
+
+
+def model_type_label(t):
+    """The type of a model as the Status column shows it: Civitai's own name, a few spelled the way the site spells them."""
+    t = str(t or "").strip()
+    if not t:
+        return ""
+    return MODEL_TYPE_NAMES.get(re.sub(r"[^a-z0-9]", "", t.lower()), re.sub(r"(?<=[a-z])(?=[A-Z])", " ", t))
 
 
 def check_link(url, apikey, extra=None):
@@ -1730,6 +1749,12 @@ def local_check(res, extra):
                                               "It holds another model or an unknown one." % r["alt"]}
     state = r["alt_state"] if r["alt"] else r["base_state"]
     if state == "free":
+        # nothing in the folder this link is going to, but the history may remember the same version in ANOTHER folder
+        rec = history_find("model:%s" % res.get("vid"))
+        if rec and not rec.get("note") and flag(extra, "MODEL") and str(extra.get("EXISTING", "ask")).lower() != "overwrite":
+            old = rec.get("folder") or ""
+            if old and os.path.isdir(old) and _norm(old) != _norm(folder):
+                return {"kind": "downloaded", "text": "This version was downloaded earlier (%s) into another folder:\n%s" % (rec["time"][:16], old)}
         return None
     if flag(extra, "MODEL") and str(extra.get("EXISTING", "ask")).lower() != "overwrite" and res.get("primary"):
         orig = safe_name(res["primary"], 200)
@@ -1740,12 +1765,25 @@ def local_check(res, extra):
                 nice = readable_file_name(orig, res["name"], res.get("ver"), several)
                 if nice:
                     names.add(pre + nice)
+        found = None
         for n in names:
             fp = os.path.join(folder, n)
             if os.path.exists(fp) and os.path.getsize(fp) > 0:
-                rec = history_find("model:%s" % res.get("vid"))
-                when = (" on %s" % rec["time"][:16]) if rec else ""
-                return {"kind": "downloaded", "text": "This version is already downloaded%s:\n%s" % (when, fp)}
+                found = fp
+                break
+        if not found:  # the same file saved earlier under another prefix (older versions, another prefix setting)
+            try:
+                for n in sorted(os.listdir(folder)):
+                    fp = os.path.join(folder, n)
+                    if n.endswith(orig) and os.path.isfile(fp) and os.path.getsize(fp) > 0:
+                        found = fp
+                        break
+            except OSError:
+                pass
+        if found:
+            rec = history_find("model:%s" % res.get("vid"))
+            when = (" on %s" % rec["time"][:16]) if rec else ""
+            return {"kind": "downloaded", "text": "This version is already downloaded%s:\n%s" % (when, found)}
     return None
 
 
@@ -1763,6 +1801,7 @@ class LinkChecker:
         self.state = {}       # link -> queued / ok / problem / kept
         self.kinds = {}       # link -> kind of the problem it was given
         self.titles = {}      # link -> "Model name - version" (shown in the table)
+        self.types = {}       # link -> the type of the model as Civitai names it (LORA, Checkpoint...), shown in the Status column
         self.seen = {}        # link -> when it appeared
         self.problems = []    # [(link, result)] waiting for the dialog
         self.last_problem = 0.0
@@ -1784,7 +1823,7 @@ class LinkChecker:
         """Call often from the window thread. Returns a batch [(link, result)] to show in the dialog, or None."""
         now = time.time() if now is None else now
         live = set(links)
-        for d in (self.state, self.seen, self.kinds, self.titles):
+        for d in (self.state, self.seen, self.kinds, self.titles, self.types):
             for u in [u for u in d if u not in live]:
                 del d[u]
         self.problems = [(u, r) for (u, r) in self.problems if u in live]
@@ -1800,7 +1839,7 @@ class LinkChecker:
             if self.thread is None:
                 self.thread = threading.Thread(target=self._worker, daemon=True)
                 self.thread.start()
-            self.q_in.put((u, apikey, extra_fn() if extra_fn else None))
+            self.q_in.put((u, apikey, extra_fn(u) if extra_fn else None))
         while True:
             try:
                 u, res = self.q_out.get_nowait()
@@ -1812,6 +1851,8 @@ class LinkChecker:
             label = (res.get("name") or "model") + ((" (version: %s)" % res["ver"]) if res.get("ver") else "")
             if res.get("name"):
                 self.titles[u] = res["name"] + ((" - " + res["ver"]) if res.get("ver") else "")
+            if res.get("mtype"):
+                self.types[u] = res["mtype"]
             if kind == "error":
                 self.state[u] = "ok"
                 self.log("Link check: could not check %s - %s. The link stays in the list." % (label, res.get("text")))
@@ -1941,12 +1982,12 @@ def cleanup_after_run(log):
         lines.append("   ... and %d more" % (len(parts) - 6))
     if dirs:
         lines += ["", "%d folder(s) created by this run would stay empty without them." % len(dirs)]
-    lines += ["", "Delete them?", "(An incomplete file can be resumed by downloading the same link again.)"]
+    lines += ["", "Delete them? (An incomplete file can be resumed by downloading the same link again.)"]
     fn = ASK_CLEANUP["fn"]
     if not fn:
         log("Leftovers: %d incomplete file(s) - not removed" % len(parts))
         return
-    if not fn("\n".join(lines)):
+    if not fn("\n".join(lines), "Delete", "Keep the files"):
         log("Leftovers kept: %d incomplete file(s)" % len(parts))
         return
     for pth in parts:
@@ -2200,6 +2241,7 @@ _REPL = {"/": "-", "\\": "-", "|": "-", ":": " -", "*": "", "?": "", '"': "'", "
 _RESERVED = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} | {"LPT%d" % i for i in range(1, 10)}
 
 
+CHOOSE_HOOK = {"fn": None}  # tests put a function here that answers the questions of the program instead of a window
 ASK_CLEANUP = {"fn": None}  # set by the window: asks Yes/No even after Stop was pressed
 CHOOSER = {"fn": None}  # set by the window: asks the user which model files of a version to download
 WEIGHT_EXT = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".sft")
@@ -2687,7 +2729,7 @@ def decide_existing(cfg, ask, what):
         return True
     if mode in ("skip",):
         return False
-    return bool(ask("Already downloaded:\n%s\n\nDownload again?" % what))
+    return bool(ask("Already downloaded:\n%s\n\nDownload it again?" % what, "Download again", "Skip"))
 
 
 def download_first_ok(urls, dest, log, stop, token=None, name_ext=""):
@@ -2941,7 +2983,8 @@ def process_model(url, cfg, log, stop, ask, next_is_image=False):
                 else:
                     log("  SKIPPED: this version cannot be downloaded now. The link stays in the list; no folder was created.")
                     return "kept"
-            elif not ask("%s\n\n%s\n\nTry to download anyway?\n(No: nothing is created, the link stays in the list.)" % (name, acc["text"])):
+            elif not ask("%s\n\n%s\n\nTry to download anyway? If you leave it, nothing is created and the link stays in the list." % (name, acc["text"]),
+                         "Try anyway", "Leave in the list"):
                 log("  SKIPPED: this version cannot be downloaded now. The link stays in the list; no folder was created.")
                 return "kept"
     if have_any:
@@ -3381,7 +3424,8 @@ def _run_jobs(jobs, log, stop, ask, done=None, fallback_cfg=None, on_job=None):
     log("Links in the task: %d" % len(jobs))
     TB.update({"phase": "connecting", "failed": 0, "total": len(jobs), "idx": 0, "cur": 0.0})
     seen = {}  # link key -> finished OK?
-    group = {"url": None, "ok": True, "wait": None}
+    group = {"url": None, "ok": True, "wait": None, "block": False}
+    waited = []  # images that wait for the examples of the model above
     pending = []  # models downloaded with some failed images that wait for the answer at the end of the list: (url, name, note)
 
     def partial_policy(c):
@@ -3397,8 +3441,8 @@ def _run_jobs(jobs, log, stop, ask, done=None, fallback_cfg=None, on_job=None):
                 else "%d models were downloaded, but some of their images were not:" % len(items))
         names = "\n".join("  %s - %s" % (nm, nt) for _u, nm, nt in items)
         if mode == "ask":
-            return bool(ask("%s\n%s\n\nKeep %s in the list (Model file switched off) to complete %s later?\n\n"
-                            "Yes: keep in the list.   No: finish as it is." % (head, names, "it" if len(items) == 1 else "them", "it" if len(items) == 1 else "them")))
+            return bool(ask("%s\n%s\n\nKeep %s in the list (Model file switched off) to complete %s later, or finish as it is?"
+                            % (head, names, "it" if len(items) == 1 else "them", "it" if len(items) == 1 else "them"), "Keep in queue", "Finish as is"))
         keep = mode == "keep"
         if when != "none":
             on_job("", "notice:%s\n%s\n\n%s" % (head, names, "Kept in the list with the Model file switched off." if keep else "Finished as they are."))
@@ -3415,7 +3459,7 @@ def _run_jobs(jobs, log, stop, ask, done=None, fallback_cfg=None, on_job=None):
                 pending.append(group["wait"])  # the answer comes at the end of the list
             else:
                 done(group["url"])
-        group["url"], group["ok"], group["wait"] = None, True, None
+        group["url"], group["ok"], group["wait"], group["block"] = None, True, None, False
 
     for i, job in enumerate(jobs, 1):
         u, cfg, k = job.url, job.cfg, job.key
@@ -3424,6 +3468,13 @@ def _run_jobs(jobs, log, stop, ask, done=None, fallback_cfg=None, on_job=None):
             safe_cleanup(log)
             return
         log("[%d/%d] %s" % (i, len(jobs), u))
+        if (job.kind != "model" and group["block"] and job.parent is not None and job.parent.url == group["url"]
+                and cfg.get("OWN_FOLDER") != "1" and not cfg.get("DIR")):
+            log("  WAITING: the examples of the model above are not complete, so this image waits (the numbering must start with the examples)")
+            job.status = "waiting"
+            on_job(u, "waiting")
+            waited.append(u)
+            continue
         TB["idx"], TB["cur"] = i - 1, 0.0
         on_job(u, "running")
         if k in seen:
@@ -3494,8 +3545,10 @@ def _run_jobs(jobs, log, stop, ask, done=None, fallback_cfg=None, on_job=None):
                 info_ = (u, STATE.get("model_name") or u, job.note)
                 if when_ == "end":
                     group["wait"], group["cfg"] = info_, cfg
+                    group["block"] = True  # the answer comes later: the gallery images wait for it
                 elif decide([info_], mode_, when_):
                     group["ok"] = False
+                    group["block"] = True
                     keep_model(u)
         elif ok:
             done(u)
@@ -3511,6 +3564,8 @@ def _run_jobs(jobs, log, stop, ask, done=None, fallback_cfg=None, on_job=None):
         else:
             for u_, _nm, _nt in pending:
                 done(u_)
+    if waited:
+        log("%d image link(s) wait in the list for the examples of their model; they go on the next run." % len(waited))
     safe_cleanup(log)
     log("Done.")
 
@@ -3575,24 +3630,45 @@ def parse_version(text):
     return tuple(int(n) for n in re.findall(r"\d+", str(text or ""))[:4])
 
 
-def latest_release(repo, timeout=8):
-    """The newest release of a GitHub repository -> (tag, page address). The address /releases/latest answers with a redirect
-    to the page of the newest (not pre-)release; reading that redirect needs no API (the API allows few requests per hour)."""
+def latest_release(repo, timeout=10):
+    """The newest release of a GitHub repository -> (tag, page address). First the address /releases/latest, which answers with a
+    redirect to the page of the newest (not pre-)release (no API, no request limit); if that does not work (a blocked or slow
+    github.com, a proxy), the API of GitHub is asked instead (it allows few requests per hour, enough for one check in 12 hours)."""
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *a, **k):
             return None
 
-    opener = urllib.request.build_opener(NoRedirect())
-    req = urllib.request.Request("https://github.com/%s/releases/latest" % repo, headers={"User-Agent": "CivitaiGrabber/" + VERSION})
+    headers = {"User-Agent": "CivitaiGrabber/" + VERSION}
+    problems = []
+    for attempt in (1, 2):  # github.com answers with pauses now and then: a second try after a moment
+        try:
+            opener = urllib.request.build_opener(NoRedirect())
+            try:
+                opener.open(urllib.request.Request("https://github.com/%s/releases/latest" % repo, headers=headers), timeout=timeout)
+                problems.append("unexpected answer")
+            except urllib.error.HTTPError as e:
+                m = re.search(r"/releases/tag/([^/?#]+)$", e.headers.get("Location") or "")
+                if e.code in (301, 302, 303, 307, 308) and m:
+                    tag = urllib.parse.unquote(m.group(1))
+                    return tag, "https://github.com/%s/releases/tag/%s" % (repo, m.group(1))
+                problems.append("no release found (HTTP %s)" % e.code)
+                break  # a real answer without a release: asking again will not help
+            break
+        except Exception as e:  # noqa
+            problems.append(str(e) or e.__class__.__name__)
+            if attempt == 1:
+                time.sleep(1.5)
     try:
-        opener.open(req, timeout=timeout)
-    except urllib.error.HTTPError as e:
-        m = re.search(r"/releases/tag/([^/?#]+)$", e.headers.get("Location") or "")
-        if e.code in (301, 302, 303, 307, 308) and m:
-            tag = urllib.parse.unquote(m.group(1))
-            return tag, "https://github.com/%s/releases/tag/%s" % (repo, m.group(1))
-        raise RuntimeError("no release found (HTTP %s)" % e.code)
-    raise RuntimeError("unexpected answer")
+        with urllib.request.urlopen(urllib.request.Request("https://api.github.com/repos/%s/releases/latest" % repo,
+                                                           headers=dict(headers, Accept="application/vnd.github+json")), timeout=timeout) as r:
+            d = json.load(r)
+        tag = str(d.get("tag_name") or "")
+        if tag:
+            return tag, d.get("html_url") or "https://github.com/%s/releases/tag/%s" % (repo, urllib.parse.quote(tag))
+        problems.append("the API answer has no release")
+    except Exception as e:  # noqa
+        problems.append("API: " + (str(e) or e.__class__.__name__))
+    raise RuntimeError("; ".join(problems))
 
 
 def checkbox_png(px, checked, border, fill, mark, gap=0):
@@ -3703,7 +3779,7 @@ PARTIAL_LABELS = [("Ask", "ask"), ("Keep in queue", "keep"), ("Finish", "finish"
 NOTICE_LABELS = [("After each job", "each"), ("At the end of the list", "end"), ("Don't notify", "none")]
 
 
-FLAG_KEYS = ("VIDEO", "ORIGINAL", "COMFY", "WEBP2JPG", "USE_SUBFOLDER", "BRIDGE", "DSCR_AS_MODEL", "MODEL", "RENAME_ID", "USE_API", "DARK", "CHECK_UPDATES", "COL_PICS", "COL_GALLERY")
+FLAG_KEYS = ("VIDEO", "ORIGINAL", "COMFY", "WEBP2JPG", "USE_SUBFOLDER", "BRIDGE", "DSCR_AS_MODEL", "MODEL", "RENAME_ID", "USE_API", "DARK", "CHECK_UPDATES", "COL_PICS", "COL_GALLERY", "BRIDGE_DARK")
 TEXT_KEYS = ("TOKEN", "PATH", "PREFIX", "PICS", "IMGFOLDER", "DSCR", "GALLERY")
 
 
@@ -3854,6 +3930,7 @@ def main_gui():
 
     v = {k: tk.StringVar() for k in TEXT_KEYS}
     b = {k: tk.BooleanVar() for k in FLAG_KEYS}
+    b["BRIDGE_DARK"].trace_add("write", lambda *_: setattr(BRIDGE, "dark", bool(b["BRIDGE_DARK"].get())))  # the extension is told in the ping answer
     existing_var = tk.StringVar(value="Ask")
     partial_var = tk.StringVar(value="Ask")
     notice_var = tk.StringVar(value="After each job")
@@ -4213,6 +4290,8 @@ def main_gui():
             pass
         return "dark10"
 
+    title_log = {"n": 0}
+
     def titlebar_now(win, on, plan):
         try:
             import ctypes
@@ -4236,6 +4315,9 @@ def main_gui():
             if plan == "win11":
                 put(35, 0x00221F1E if on else 0xFFFFFFFF)  # caption colour #1e1f22 (the colour of the input fields)
                 put(36, 0x00E5E1DF if on else 0xFFFFFFFF)  # title text colour #dfe1e5
+            if title_log["n"] < 14:
+                title_log["n"] += 1
+                file_log("Title bar: window %r hwnd=%s plan=%s dark=%s result=%s" % (win.title(), hwnd, plan, on, r))
             u.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x27)  # frame changed
             u.RedrawWindow(hwnd, None, None, 0x0001 | 0x0004 | 0x0400 | 0x0100)  # repaint the frame now
             if (plan, on) not in title_seen:
@@ -4614,8 +4696,8 @@ def main_gui():
 
     def do_signin():
         if AUTH.signed_in():
-            if messagebox.askyesno("Civitai Grabber", "Sign out?\n\nThe program will use the API token again (if \"Connect via API\" is ticked) "
-                                   "(you can also revoke the access in your Civitai account: Connected Apps)."):
+            if choose("Sign out?\n\nThe program will use the API token again (if \"Connect via API\" is ticked) "
+                      "(you can also revoke the access in your Civitai account: Connected Apps).", [("Sign out", True), ("Stay signed in", False)], escape=False):
                 AUTH.sign_out()
                 refresh_signin_ui()
                 log("Signed out.")
@@ -4632,7 +4714,7 @@ def main_gui():
                 err = str(e)
                 file_log("sign-in failed: %r" % (e,))
                 auth_q.put(lambda: (refresh_signin_ui(), log("Sign-in failed: %s" % err),
-                                    messagebox.showerror("Civitai Grabber", "Sign-in failed:\n%s" % err)))
+                                    choose("Sign-in failed:\n%s" % err, [("OK", True)])))
             else:
                 auth_q.put(lambda: (refresh_signin_ui(), log("Signed in on %s. From now on the sign-in is used "
                                                             "instead of the API token." % site)))
@@ -4771,6 +4853,15 @@ def main_gui():
         p = parent.get(r.id)
         return p is not None and p.ov.get("HOLD") == "1"  # the images of a model on hold wait with it
 
+    def extra_for(u):
+        """The settings a link is checked with: the common options plus the folder, prefix and Model file of ITS row."""
+        cfg = collect_cfg()
+        r = next((x for x in table["rows"] if x.url == u), None)
+        if r is not None:
+            e = effective(r)
+            cfg.update({k: e[k] for k in ("PATH", "PREFIX", "MODEL")})
+        return cfg
+
     def active_links():  # the links that will be downloaded: not on hold
         parent = layout()[0]
         return [r.url for r in table["rows"] if not is_held(r, parent)]
@@ -4861,8 +4952,13 @@ def main_gui():
         return max(18, int((w - 14) / 6.5))
 
     def short_path(p, n=None):
-        p, n = p or "", n or folder_chars()
-        return p if len(p) <= n else "\u2026" + p[-(n - 1):]
+        """The folder as far as it fits: without the closing backslash, and the cut falls between folder names, so all rows look alike."""
+        p, n = (p or "").rstrip("\\/") or (p or ""), n or folder_chars()
+        if len(p) <= n:
+            return p
+        cut = len(p) - (n - 1)
+        m = re.search(r"[\\/]", p[cut - 1:])
+        return "\u2026" + p[cut - 1 + m.start():] if m else "\u2026" + p[-(n - 1):]
 
     def status_of(r):
         st = table["state"].get(r.url)
@@ -4873,6 +4969,8 @@ def main_gui():
         cs = checker.state.get(r.url)
         if cs in (None, "queued"):
             return "checking"
+        if cs == "ok":
+            return model_type_label(checker.types.get(r.url)) or "ok"  # the link is fine: say what it is
         return {"problem": "warning", "kept": "kept"}.get(cs, "ok")
 
     def link_text(r, child, e):
@@ -5135,7 +5233,7 @@ def main_gui():
             with open(p, "w", encoding="utf-8") as f:
                 f.write(SAMPLE_TASK)
         except OSError as ex:
-            messagebox.showerror("Civitai Grabber", "Cannot write the file:\n%s" % ex)
+            choose("Cannot write the file:\n%s" % ex, [("OK", True)])
             return
         log("Sample task file saved: %s" % p)
         if not open_path(p):
@@ -5148,7 +5246,7 @@ def main_gui():
         try:
             explicit, urls = read_task_file(p)
         except OSError as ex:
-            messagebox.showerror("Civitai Grabber", "Cannot read the file:\n%s" % ex)
+            choose("Cannot read the file:\n%s" % ex, [("OK", True)])
             return
         cur = collect_cfg()
         conflicts = []
@@ -5172,10 +5270,8 @@ def main_gui():
                     lines.append("TOKEN (values hidden)")
                 else:
                     lines.append("%s:  window = %r,  file = %r" % (k, cur[k], explicit[k]))
-            use_file = messagebox.askyesno(
-                "Civitai Grabber",
-                "The task file and the window have different values:\n\n%s\n\n"
-                "Yes = use the values from the file\nNo = keep the window values" % "\n".join(lines))
+            use_file = choose("The task file and the window have different values:\n\n%s" % "\n".join(lines),
+                              [("Use the file's values", True), ("Keep the window's values", False)], escape=False)
             if not use_file:
                 for k in conflicts:
                     take.pop(k, None)
@@ -5186,9 +5282,8 @@ def main_gui():
         render_table()
         if urls:
             if current_links():
-                ans = messagebox.askyesnocancel(
-                    "Civitai Grabber", "The link list is not empty.\n\nYes = replace it with the links from the file\n"
-                                       "No = add them to the end\nCancel = do not load the links")
+                ans = choose("The link list is not empty.\n\nReplace it with the links from the file, or add them to the end?",
+                             [("Replace the list", True), ("Add to the end", False), ("Do not load the links", None)], escape=None)
                 if ans is None:
                     urls = []
                 elif ans:
@@ -5411,9 +5506,13 @@ def main_gui():
             save_settings()
 
         lim_var.trace_add("write", apply_limit)
-        cb_dark = ttk.Checkbutton(gen, text="Dark theme", variable=b["DARK"],
+        row_t = ttk.Frame(gen)
+        row_t.grid(row=1, column=0, columnspan=2, sticky="w", pady=(12, 4))
+        cb_dark = ttk.Checkbutton(row_t, text="Dark theme", variable=b["DARK"],
                                   command=lambda: (apply_theme(bool(b["DARK"].get())), save_settings()))
-        cb_dark.grid(row=1, column=0, columnspan=2, sticky="w", pady=(12, 4))
+        cb_dark.pack(side="left")
+        cb_bdark = ttk.Checkbutton(row_t, text="Dark window of the browser extension", variable=b["BRIDGE_DARK"], command=save_settings)
+        cb_bdark.pack(side="left", padx=(16, 0))
         row_c = ttk.Frame(gen)
         row_c.grid(row=2, column=0, columnspan=2, sticky="we", pady=4)
         ttk.Label(row_c, text="Table columns:").pack(side="left")
@@ -5432,7 +5531,7 @@ def main_gui():
 
         def report(tag, err):
             if not tag:
-                upd_status.set("Could not check (no connection?)")
+                upd_status.set("Could not check (%s)" % (str(err).split(";")[0][:70] if err else "no connection?"))
             elif parse_version(tag) > parse_version(VERSION):
                 upd_status.set("New version available: %s" % str(tag).lstrip("vV"))
             else:
@@ -5464,6 +5563,8 @@ def main_gui():
         tips.append((cb_cg, "Show the Gallery column in the link table. Hidden columns give their room to the Link and Folder columns; "
                             "the values stay in the rows and the fields above the table still work."))
         tips.append((cb_dark, "Dark colours for the whole program. Windows system message boxes stay light."))
+        tips.append((cb_bdark, "Draws the small window of the browser extension in dark colours. It is a setting of its own: it does not have to match the "
+                               "program's theme. The extension remembers it when the program is closed."))
         tips.append((cb_upd, "At start (not more than once in 12 hours) the program asks github.com which release is the newest "
                              "and shows a link at the top if it is newer than this one. Nothing is downloaded or installed by itself."))
         for widget, text in tips:
@@ -5509,6 +5610,7 @@ def main_gui():
         x = root.winfo_rootx() + max(0, (root.winfo_width() - w0) // 2)
         y = root.winfo_rooty() + max(0, (root.winfo_height() - h0) // 3)
         win.geometry("+%d+%d" % (x, y))
+        win.wait_visibility()  # focus only after the window is shown: set before, it leaves the title bar light until the next click
         win.focus_set()
 
     def show_help():
@@ -5533,10 +5635,10 @@ def main_gui():
                 status.configure(text="Launch from the browser: " + ("allowed" if launcher_registered() else "not allowed"))
 
         def allow():
-            if messagebox.askyesno("Civitai Grabber", CONSENT_TEXT, parent=win):
+            if choose(CONSENT_TEXT, [("Allow", True), ("Do not allow", False)], parent=win, escape=False):
                 err = register_launcher()
                 if err:
-                    messagebox.showerror("Civitai Grabber", err, parent=win)
+                    choose(err, [("OK", True)], parent=win)
                 launch_state["asked"] = True
                 save_settings()
             refresh()
@@ -5544,7 +5646,7 @@ def main_gui():
         def remove():
             err = unregister_launcher()
             if err:
-                messagebox.showerror("Civitai Grabber", err, parent=win)
+                choose(err, [("OK", True)], parent=win)
             refresh()
 
         status.pack(side="left")
@@ -5649,17 +5751,17 @@ def main_gui():
                 table["redo"].clear()
                 return
 
-    def ask(msg):
+    def ask(msg, yes="Yes", no="No"):
         ev, holder = threading.Event(), {}
-        ask_q.put((msg, holder, ev))
+        ask_q.put((msg, holder, ev, (yes, no)))
         while not ev.wait(0.3):
             if stop.is_set():
                 return False
         return holder.get("ans", False)
 
-    def ask_cleanup(msg):
+    def ask_cleanup(msg, yes="Yes", no="No"):
         ev, holder = threading.Event(), {}
-        ask_q.put((msg, holder, ev))
+        ask_q.put((msg, holder, ev, (yes, no)))
         ev.wait(300)
         return holder.get("ans", False)
 
@@ -5692,7 +5794,7 @@ def main_gui():
         total = ttk.Label(win, text="")
         total.pack(anchor="w", padx=14, pady=(8, 0))
         ttk.Label(win, text="Stop ends the whole run and keeps this link in the list - use it if you need to look into the choice first.",
-                  wraplength=720, justify="left", foreground="#555").pack(anchor="w", padx=14, pady=(6, 0))
+                  wraplength=720, justify="left", foreground=("#a9b4c0" if b["DARK"].get() else "#555")).pack(anchor="w", padx=14, pady=(6, 0))
 
         def update_total(*_):
             sel = [rows[i] for i, v in enumerate(vars_) if v.get()]
@@ -5755,6 +5857,43 @@ def main_gui():
             return "could not start (ports busy)"
         return "connected" if BRIDGE.connected() else "waiting for the extension"
 
+    def choose(text, buttons, title="Civitai Grabber", parent=None, escape=None):
+        """A message box in the colours of the program, with buttons that say what they do (instead of Yes / No).
+        buttons: [(label, value), ...] left to right; Esc and the close button give `escape`. No button has the focus at first
+        (the window may open while you are typing); Tab and Enter work as everywhere in the program."""
+        if CHOOSE_HOOK["fn"]:  # tests
+            return CHOOSE_HOOK["fn"](text, buttons)
+        owner = parent or root
+        win = tk.Toplevel(owner)
+        win.title(title)
+        win.transient(owner)
+        try:
+            if app_icon:
+                win.iconphoto(False, app_icon)
+        except tk.TclError:
+            pass
+        result = {"v": escape}
+        ttk.Label(win, text=text, wraplength=520, justify="left").pack(anchor="w", padx=16, pady=(14, 4))
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=16, pady=(8, 14))
+
+        def done(val):
+            result["v"] = val
+            win.destroy()
+
+        for label, val in reversed(buttons):
+            ttk.Button(bar, text=label, command=lambda v=val: done(v)).pack(side="right", padx=(8, 0))
+        win.protocol("WM_DELETE_WINDOW", lambda: done(escape))
+        win.bind("<Escape>", lambda _e: done(escape))
+        win.update_idletasks()
+        x = owner.winfo_rootx() + max(0, (owner.winfo_width() - win.winfo_width()) // 2)
+        y = owner.winfo_rooty() + max(0, (owner.winfo_height() - win.winfo_height()) // 3)
+        win.geometry("+%d+%d" % (x, y))
+        win.grab_set()
+        win.focus_set()
+        owner.wait_window(win)
+        return result["v"]
+
     def ask_remove_links(rows, labels=("Remove link", "Keep link")):
         """Modal window about links that cannot be downloaded now; rows = [(link, title, reason)].
         Returns the links to remove from the list. Closing the window keeps everything (Enter does nothing on purpose:
@@ -5769,13 +5908,14 @@ def main_gui():
             pass
         result = {"gone": []}
         ticks = []
+        url_fg = "#a9b4c0" if b["DARK"].get() else "#555"
         bold = tkfont.nametofont("TkDefaultFont").copy()
         bold.configure(weight="bold")
         if len(rows) == 1:
             u, title, reason = rows[0]
             ttk.Label(win, text=title, font=bold, wraplength=560, justify="left").pack(anchor="w", padx=14, pady=(12, 2))
             ttk.Label(win, text=reason, wraplength=560, justify="left").pack(anchor="w", padx=14, pady=(0, 6))
-            ttk.Label(win, text=u, wraplength=560, justify="left", foreground="#555").pack(anchor="w", padx=14)
+            ttk.Label(win, text=u, wraplength=560, justify="left", foreground=url_fg).pack(anchor="w", padx=14)
             yes_text, no_text = labels
         else:
             ttk.Label(win, text="%d links cannot be downloaded now. Ticked links will be removed from the list:" % len(rows),
@@ -5796,7 +5936,7 @@ def main_gui():
                 ticks.append((u, var))
                 ttk.Checkbutton(inner, text=title, variable=var).pack(anchor="w", pady=(6, 0))
                 ttk.Label(inner, text=reason, wraplength=560, justify="left").pack(anchor="w", padx=(24, 0))
-                ttk.Label(inner, text=u, wraplength=560, justify="left", foreground="#555").pack(anchor="w", padx=(24, 0))
+                ttk.Label(inner, text=u, wraplength=560, justify="left", foreground=url_fg).pack(anchor="w", padx=(24, 0))
             yes_text, no_text = "Remove ticked", "Keep all"
         bar = ttk.Frame(win)
         bar.pack(fill="x", padx=14, pady=12)
@@ -5844,10 +5984,10 @@ def main_gui():
         links = current_links()
         for u in list(gone):
             below = [x for x in images_below(u, links) if x not in gone]
-            if below and messagebox.askyesno(
-                    "Civitai Grabber",
-                    "%d image link(s) follow the removed model link in the list and belong to it.\n\nRemove them too?\n"
-                    "(If you keep them, they will be saved into the folder of the model above them, or into the output folder.)" % len(below)):
+            if below and choose(
+                    "%d image link(s) follow the removed model link in the list and belong to it.\n\nRemove them too? "
+                    "(If you keep them, they will be saved into the folder of the model above them, or into the output folder.)" % len(below),
+                    [("Remove them too", True), ("Keep them", False)], escape=False):
                 gone.extend(below)
         for u in gone:
             remove_line(u)
@@ -5884,7 +6024,7 @@ def main_gui():
         except queue.Empty:
             pass
         for text_ in notices:
-            messagebox.showinfo("Civitai Grabber", text_)
+            choose(text_, [("OK", True)])
         try:
             while True:
                 u_done, folder_done = done_q.get_nowait()
@@ -5907,8 +6047,8 @@ def main_gui():
             add_links(incoming)
             tb_flash(2)
         try:
-            msg, holder, ev = ask_q.get_nowait()
-            holder["ans"] = messagebox.askyesno("Civitai Grabber", msg)
+            msg, holder, ev, names = ask_q.get_nowait()
+            holder["ans"] = choose(msg, [(names[0], True), (names[1], False)], escape=False)
             ev.set()
         except queue.Empty:
             pass
@@ -5918,7 +6058,7 @@ def main_gui():
             c_ev.set()
         except queue.Empty:
             pass
-        rows = checker.tick(current_links(), active_token(), collect_cfg)
+        rows = checker.tick(current_links(), active_token(), extra_for)
         if rows:
             handle_problems(rows)
         refresh_dynamic()
@@ -5952,7 +6092,7 @@ def main_gui():
         if (not launch_state["asked"] and BRIDGE.connected() and sys.platform.startswith("win")
                 and not launcher_registered()):
             launch_state["asked"] = True  # ask once, when the extension has connected for the first time
-            if messagebox.askyesno("Civitai Grabber", CONSENT_TEXT):
+            if choose(CONSENT_TEXT, [("Allow", True), ("Do not allow", False)], escape=False):
                 err = register_launcher()
                 log("Launch from the browser allowed." if not err else "Could not write the registry entry: %s" % err)
             save_settings()
@@ -5987,9 +6127,9 @@ def main_gui():
         try:
             import PIL  # noqa
         except ImportError:
-            if messagebox.askyesno("Civitai Grabber",
-                                   "WebP conversion needs the Pillow library, which is not installed for the Python "
-                                   "that runs this script:\n%s\n\nInstall it now (pip install pillow)?" % python_for_pip()):
+            if choose("WebP conversion needs the Pillow library, which is not installed for the Python "
+                      "that runs this script:\n%s\n\nInstall it now (pip install pillow)?" % python_for_pip(),
+                      [("Install now", True), ("Not now", False)], escape=False):
                 threading.Thread(target=install_pillow, daemon=True).start()
 
     def worker(jobs, cfg, need_pillow=False):
@@ -6060,16 +6200,14 @@ def main_gui():
         KEPT_LINKS.clear()
         KEPT_LINKS.update(u for u in urls if checker.state.get(u) == "kept")
         if not cfg["DSCR"] and cfg["DSCR_AS_MODEL"] != "1":
-            if not messagebox.askyesno("Civitai Grabber", "The description file name is empty: no description and no "
-                                                          "generation metadata will be written.\n\nContinue anyway?"):
+            if not choose("The description file name is empty: no description and no generation metadata will be written.\n\nContinue anyway?",
+                          [("Continue", True), ("Cancel", False)], escape=False):
                 return
         off = [r for r in active if re.search(r"/models/\d+", r.url) and effective(r, parent)["MODEL"] != "1" and not r.ov.get("MODELDONE")]
         if off:
-            ans = messagebox.askyesnocancel(
-                "Civitai Grabber",
-                "The \"Model file\" option is OFF.\n\n%d link(s) in the list lead to models: only their examples and "
-                "description will be downloaded, without the model files.\n\n"
-                "Yes - turn \"Model file\" ON and start\nNo - start without model files\nCancel - go back" % len(off))
+            ans = choose("The \"Model file\" option is OFF.\n\n%d link(s) in the list lead to models: only their examples and "
+                         "description will be downloaded, without the model files." % len(off),
+                         [("Turn Model file ON and start", True), ("Start without model files", False), ("Go back", None)], escape=None)
             if ans is None:
                 return
             if ans:
@@ -6085,9 +6223,9 @@ def main_gui():
             try:
                 import PIL  # noqa
             except ImportError:
-                need_pillow = messagebox.askyesno(
-                    "Civitai Grabber", "WebP to JPG conversion needs the Pillow library, which is not installed for the "
-                                       "Python that runs this script:\n%s\n\nInstall it now (pip install pillow)?" % python_for_pip())
+                need_pillow = choose("WebP to JPG conversion needs the Pillow library, which is not installed for the "
+                                     "Python that runs this script:\n%s\n\nInstall it now (pip install pillow)?" % python_for_pip(),
+                                     [("Install now", True), ("Not now", False)], escape=False)
         jobs = make_jobs(urls, cfg)  # the parent of an image is found in the same order as in the table (held rows go with their model)
         for job, r in zip(jobs, active):
             e = effective(r, parent)
@@ -6260,7 +6398,7 @@ if __name__ == "__main__":
         c, u = parse_task_file(sys.argv[1])
         if flag(c, "BRIDGE"):
             BRIDGE.start()
-        run_task(c, u, lambda m: (file_log(m), print(m)), threading.Event(), lambda m: False)
+        run_task(c, u, lambda m: (file_log(m), print(m)), threading.Event(), lambda m, *a: False)
     elif another_instance_running():
         if not from_browser:
             try:

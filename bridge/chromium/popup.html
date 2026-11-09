@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
-  body { font: 13px sans-serif; width: 300px; padding: 10px; box-sizing: border-box; }
+  body { font: 13px sans-serif; width: 256px; padding: 10px; box-sizing: border-box; background: #fff; color: #222; }
   h1 { font-size: 14px; margin: 0 0 8px; }
   #ver { font-weight: normal; color: #555; }
   .ok { color: #1a7f37; } .wait { color: #c62828; font-weight: bold; } .err { color: #c62828; font-weight: bold; }
@@ -28,6 +28,42 @@
   #pendList label { display: inline; margin: 0; cursor: pointer; }
   button.alt { background: #fff; color: #2162be; border: 1px solid #2162be; }
   button.alt:hover { background: #eaf1fc; }
+  #reactRow, #closeRow { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+  #reactRow .lbl { flex: 1; min-width: 0; font-size: 12px; font-weight: bold; }
+  #closeRow .lbl { flex: 1; min-width: 0; }
+  .ctl { width: 96px; flex: none; }                      /* the two icon buttons and the list of "Close tabs" share this width: their edges line up */
+  #reactGroup { display: flex; gap: 8px; }
+  #reactGroup .trw { flex: 1; display: block; }
+  #closeMode { width: 96px; margin: 0; }
+  #addWrap { display: block; }
+  button.tri { width: 100%; height: 32px; margin: 0; padding: 0; display: flex; align-items: center; justify-content: center;
+               background: #e3e6ea; color: #333; border: 1px solid #c4cad2; }
+  button.tri:hover { background: #d3d7dd; }
+  button.tri[data-state="on"] { background: #1a7f37; color: #fff; border-color: #1a7f37; }
+  button.tri[data-state="on"]:hover { background: #166a2e; }
+  button.tri[data-state="off"] { background: #d9730d; color: #fff; border-color: #d9730d; }
+  button.tri[data-state="off"]:hover { background: #b9600a; }
+  button.tri:disabled, button.tri:disabled:hover { cursor: not-allowed; background: #eef0f3; color: #a3a9b2; border-color: #cdd2d9; }
+  button.tri svg { display: block; }
+  /* dark window: a setting of the program (Setup), told to the extension when they talk; remembered while the program is closed */
+  body.dark { background: #26282c; color: #e3e5e8; color-scheme: dark; }
+  body.dark #ver, body.dark small, body.dark #attList span { color: #a3a9b2; }
+  body.dark .ok { color: #5fd07c; } body.dark .wait, body.dark .err { color: #ff8a80; }
+  body.dark button { background: #2d6cdf; color: #fff; }
+  body.dark button:hover { background: #2558b8; }
+  body.dark button:active { background: #1f4a9c; }
+  body.dark button:disabled { background: #3b4f78; color: #8f9bb3; }
+  body.dark select { background: #33363b; color: #e3e5e8; border: 1px solid #5a5e66; }
+  body.dark #attention { background: #3a3320; }
+  body.dark #attList a { color: #8ab4f8; }
+  body.dark #pendingBox { background: #233044; border-left-color: #4a88ee; }
+  body.dark button.alt { background: transparent; color: #8ab4f8; border: 1px solid #8ab4f8; }
+  body.dark button.alt:hover { background: #2b3a54; }
+  body.dark button.tri { background: #3a3d43; color: #e3e5e8; border-color: #5a5e66; }
+  body.dark button.tri:hover { background: #4a4d54; }
+  body.dark button.tri[data-state="on"] { background: #1f8f42; color: #fff; border-color: #1f8f42; }
+  body.dark button.tri[data-state="off"] { background: #e0801a; color: #fff; border-color: #e0801a; }
+  body.dark button.tri:disabled, body.dark button.tri:disabled:hover { background: #2f3135; color: #6d727a; border-color: #484b52; }
   #attClear { width: auto; display: inline-block; margin: 4px 0 0; padding: 3px 8px; font-size: 12px; }
 </style></head>
 <body>
@@ -43,16 +79,24 @@
     <ul id="attList"></ul>
     <button id="attClear">Clear the list</button>
   </div>
-  <button id="addPage">Add this page to the list</button>
+  <span id="addWrap"><button id="addPage">Add this page to the list</button></span>
   <small id="addHint"></small>
   <div id="msg"></div>
-  <label>Close tabs of finished links:
-    <select id="closeMode">
+  <div id="reactRow">
+    <span class="lbl">On the model page:</span>
+    <span class="ctl" id="reactGroup">
+      <span class="trw" id="likeWrap"><button id="likeBtn" class="tri" data-state="neutral"></button></span>
+      <span class="trw" id="bellWrap"><button id="bellBtn" class="tri" data-state="neutral"></button></span>
+    </span>
+  </div>
+  <div id="closeRow">
+    <span class="lbl">Close finished tabs:</span>
+    <select id="closeMode" class="ctl">
       <option value="never">Never</option>
       <option value="always">Always</option>
       <option value="ask">Ask</option>
     </select>
-  </label>
+  </div>
   <small>Applies to pages you added with the buttons here or the right-click menu on a page. "Ask" collects the finished pages in a list here (with a notification): you choose which to close and which to keep open.</small>
   <div id="pendingBox" style="display:none">
     <h2>Finished pages: close or keep open?</h2>

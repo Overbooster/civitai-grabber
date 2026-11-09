@@ -92,8 +92,22 @@ async function findServer() {
   if (!hit) return false;
   base = `http://127.0.0.1:${hit.p}`;
   info.grabberVersion = (hit.j && hit.j.version) || "";
-  browser.storage.local.set({ seen: true, launcher: !!hit.j.launcher, version: hit.j.version, lastSeen: Date.now() }).catch(() => {});
+  browser.storage.local.set({ seen: true, launcher: !!hit.j.launcher, version: hit.j.version, lastSeen: Date.now(),
+    ...(typeof hit.j.dark === "boolean" ? { bridgeDark: hit.j.dark } : {}) }).catch(() => {});
   return true;
+}
+
+// the program tells whether the extension window is dark in every ping answer: ask again now and then (at most every 2 s),
+// so a change in the program's Setup shows up in the open window within a moment
+let lastDarkPing = 0;
+async function pingDark() {
+  if (!base || Date.now() - lastDarkPing < 2000) return;
+  lastDarkPing = Date.now();
+  try {
+    const r = await timedFetch(`${base}/ping`, { headers: HDR, cache: "no-store" }, 1000);
+    const j = await r.json();
+    if (j && typeof j.dark === "boolean") browser.storage.local.set({ bridgeDark: j.dark }).catch(() => {});
+  } catch (e) { /* the connection itself is looked after by the main loop */ }
 }
 
 async function ensureServer() {
@@ -174,7 +188,7 @@ const keepAlive = () => { try { browser.runtime.getPlatformInfo().catch(() => {}
 setInterval(keepAlive, 20000);
 if (browser.alarms) {
   browser.alarms.create("civitai-grabber-tick", { periodInMinutes: 0.5 });
-  browser.alarms.onAlarm.addListener(() => { keepAlive(); mainLoop(); });
+  browser.alarms.onAlarm.addListener(() => { keepAlive(); mainLoop(); pingDark(); });
 }
 
 let looping = false;
@@ -208,6 +222,87 @@ async function mainLoop() {
   }
 }
 
+// ---- Like / notification bell on a model page that has just been added from the bridge (set in the popup: leave / on / off)
+// Runs INSIDE the page (injected), so it must not use anything from this file. It presses a button at most once, and only
+// after the state of the buttons has stopped changing (the page shows them a moment before it knows the real state).
+async function reactInPage(likeMode, bellMode) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const until = async (fn, ms) => {
+    const t0 = Date.now();
+    for (;;) {
+      const v = fn();
+      if (v) return v;
+      if (Date.now() - t0 > ms) return null;
+      await sleep(200);
+    }
+  };
+  const parts = () => {
+    const wrap = document.querySelector('[data-tour="model:like"]');
+    const likeBtn = wrap && wrap.querySelector("button");
+    const row = wrap && (wrap.closest(".flex.gap-2") || (wrap.parentElement && wrap.parentElement.parentElement));
+    const bellBtn = row && [...row.querySelectorAll("button")].find((b) => b.querySelector('svg[class*="tabler-icon-bell"]'));
+    return { likeBtn, bellBtn };
+  };
+  const likeOn = (b) => !!b.querySelector('svg[class*="thumb-up-filled"]');
+  const bellOn = (b) => {
+    const s = b.querySelector('svg[class*="tabler-icon-bell"]');
+    const c = s ? s.getAttribute("class") || "" : "";
+    return /bell-check/.test(c) ? true : /bell-plus/.test(c) ? false : null;
+  };
+  const usable = (b) => b && !b.disabled && !b.hasAttribute("data-loading");
+
+  const first = await until(() => { const x = parts(); return usable(x.likeBtn) ? x : null; }, 20000);
+  if (!first) return "buttons not found";
+  if ([...document.querySelectorAll("a, button")].some((x) => /^(sign in|log in|login)$/i.test(x.textContent.trim()))) return "not signed in";
+  let last = "", same = 0;
+  for (let i = 0; i < 20 && same < 5; i++) {
+    await sleep(300);
+    const x = parts();
+    const key = x.likeBtn ? likeOn(x.likeBtn) + "/" + (x.bellBtn ? bellOn(x.bellBtn) : "-") : "gone";
+    same = key === last ? same + 1 : 0;
+    last = key;
+  }
+  const press = async (get, want, isOn) => {
+    const b = get();
+    if (!b) return "missing";
+    const cur = isOn(b);
+    if (cur === null) return "unknown state";
+    if (cur === want) return "already";
+    b.click();
+    return (await until(() => { const x = get(); return x && isOn(x) === want; }, 6000)) ? "done" : "no change";
+  };
+  const out = [];
+  if (likeMode !== "neutral") out.push("like " + (await press(() => parts().likeBtn, likeMode === "on", likeOn)));
+  if (bellMode !== "neutral") {
+    if (likeMode !== "neutral") await sleep(1500);     // pressing Like turns the notifications on by itself: let that happen first
+    out.push("bell " + (await press(() => parts().bellBtn, bellMode === "on", bellOn)));
+  }
+  return out.join(", ");
+}
+
+async function runInPage(tabId, fn, args) {
+  if (browser.scripting && browser.scripting.executeScript) {
+    const [r] = await browser.scripting.executeScript({ target: { tabId }, func: fn, args });
+    return r && r.result;
+  }
+  const [res] = await browser.tabs.executeScript(tabId, { code: `(${fn.toString()})(...${JSON.stringify(args)})` });
+  return res;
+}
+
+let reactChain = Promise.resolve();     // one page after another, with a pause: never a burst of clicks
+function reactAfterAdd(tabId) {
+  reactChain = reactChain.then(async () => {
+    try {
+      const m = await browser.storage.local.get(["likeMode", "bellMode"]);
+      const like = m.likeMode || "neutral", bell = m.bellMode || "neutral";
+      if (like === "neutral" && bell === "neutral") return;
+      const r = await runInPage(tabId, reactInPage, [like, bell]);
+      info.last = "Model page: " + (r || "requested");
+      await sleep(1500);
+    } catch (e) { info.last = "Model page: could not react (" + e + ")"; }
+  });
+}
+
 // ---- adding links to the script's download list
 async function addUrls(urls, tab) {
   await ready;
@@ -225,7 +320,10 @@ async function addUrls(urls, tab) {
   if (!r.ok) throw new Error("HTTP " + r.status);
   if (tab && tab.url && tab.id !== undefined) {   // only the page itself is remembered, never a page that merely holds a link
     const here = normalize(tab.url);
-    if (here && good.includes(here)) { sentTabs.set(here, tab.id); saveState(); }
+    if (here && good.includes(here)) {
+      sentTabs.set(here, tab.id); saveState();
+      if (/\/models\/\d+/.test(here)) reactAfterAdd(tab.id);
+    }
   }
   return { sent: good.length, skipped: urls.length - good.length };
 }
@@ -405,6 +503,7 @@ async function handleCommand(m) {
   switch (m && m.cmd) {
     case "state": {
       if (!base) await findServer();   // fresh answer right after the worker has been started
+      await pingDark();
       const li = await browser.storage.local.get(["seen", "launcher"]);
       return { info: { ...info }, pending: pendingClose.length, pendingList: await pendingItems(), attention, seen: !!li.seen, launcher: !!li.launcher };
     }
