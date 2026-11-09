@@ -13,7 +13,7 @@ Made first of all for the author's own workflow and shared as-is: you are welcom
 **Status: public beta.** The latest version is on the [Releases](../../releases) page. It works for the author,
 but it has been tested on very few machines. Bug reports are welcome (see below).
 
-<img width="767" height="729" alt="Civitai Grabber 051_1" src="https://github.com/user-attachments/assets/d24fdc2a-5794-4efd-927c-0e6cc57e766c" />
+<img width="767" height="729" alt="Civitai Grabber 052" src="https://github.com/user-attachments/assets/87e7db2b-5c97-464c-a19f-0d7b8d0b047b" />
 
 
 ## What you need
@@ -49,13 +49,15 @@ affected, so you can paste a few links, set another folder and prefix, paste mor
 - **To change links that are already in the table**, select them (Ctrl or Shift for several): the header says
   *settings for: N selected*, and the fields above now show and change those rows only.
 - The **Status** column shows what happens to each link: *checking*, *ok*, *warning*, *running*, *done*, *error*,
-  *partial* (the model came, but some of the images did not), *hold*. Models are shown by name, not by address.
+  *partial* (the model came, but some of the images did not), *hold*. Models are shown by name, not by address; once a
+  link has been checked, the status shows what it is (*LoRA*, *Checkpoint*, *Embedding*...).
 - A model and the single image links below it form a **pack** and share one colour (the colours alternate between
   packs; a lone link has no colour). The images of a pack **follow the folder of their model**. An image that you
   give a folder of its own is marked with *.
 - **Hold** pauses the selected rows: **START** skips them until you press **Resume**. A model on hold holds its
   images too. Rows that ended with an error or *partial* come back after a restart marked *hold (error)* /
-  *hold (partial)*, so a failed link is never started again by accident.
+  *hold (partial)*, so a failed link is never started again by accident. If the examples of a model are incomplete and you keep it in the
+  list, the gallery images below it wait for it, so the numbering always starts with the examples.
 - Finished links disappear from the table, failed ones stay. **Undo / Redo** take back changes of the list. The table
   is remembered between runs.
 - **START** and **STOP** are one button: STOP appears while a task runs.
@@ -73,7 +75,8 @@ Civitai about it and shows a window if something is wrong:
 - the model is **paid** or in **early access** (the end date is shown) - unless your account has already bought it;
 - the model or version was **deleted or hidden**, or is not published (a model published a moment ago may not be
   known to the Civitai API yet: check again in a minute);
-- the model is **already downloaded**;
+- the model is **already downloaded** (also when the same file was saved earlier under another prefix, or the program's
+  history knows the same version in another folder);
 - a **folder with the same name already exists** and holds another model (or it is not known which one).
 
 For each warning you remove the link or keep it (for an existing folder the buttons are "Exclude link" and
@@ -90,7 +93,8 @@ cannot be downloaded. The taskbar button turns yellow while some link in the lis
   model*), the image subfolder, videos, original file names, WebP to JPG, naming of ID-like model files, and the
   experimental ComfyUI workflow `.json`. *Connection*: the API token (the key is shown while the field is unlocked and
   hidden when you press *Lock*). *Program*: how many recent folders and prefixes the lists remember (5 to 30), which
-  table columns are shown, the dark theme and the update check.
+  table columns are shown, the dark theme (the small window of the browser extension has its own dark switch) and the
+  update check.
 - **Three check boxes** at the top show and switch the connections: *Connect via Sign-in*, *Connect via API* and
   *Browser bridge*. Hover a box for details (who is signed in, whether a token is entered, whether the browser extension
   is connected).
@@ -162,9 +166,12 @@ do: do not share them. There is no analytics or telemetry. Two requests are not 
 check (to github.com, can be switched off) and, only after a failed request, a short network check (a bare connection
 to 1.1.1.1 or 8.8.8.8 and one simple request to the Civitai site, to tell your internet connection from the service);
 neither sends any data about you. The browser extension talks only to the program on your own computer (127.0.0.1) and
-works with the Civitai pages in your browser.
+works with the Civitai pages in your browser (the optional Like and notification switches press buttons on the pages you add).
 
 ## Browser bridge (optional, recommended)
+
+<img width="282" height="388" alt="Bridge 018" src="https://github.com/user-attachments/assets/01b3d8d5-121b-46f9-970b-beb6f4d3a824" />
+
 
 Civitai image pages cannot be read by scripts without your browser session, so some metadata and the gallery images can
 only be collected through your browser. The bridge does this reading with your own login. To add pages to the list it
@@ -179,9 +186,17 @@ list of the finished pages with check boxes, and you choose which to close and w
 something was not downloaded, or whose link carries a warning, stay open and appear in the extension's **Needs attention**
 list; when you remove such a link in the program, it disappears from that list too.
 
+**Like and notifications (optional).** The extension window has two small switches with icons, a thumb and a bell. Each has
+three positions: grey = leave as it is (the default), green = switch on, orange = switch off (the thumb turns down, the bell
+gets a minus). When you add a model page with the toolbar button or the right-click item *Add this page*, the extension sets
+the like and the notification bell on that page the way you chose. It presses a button only if its state differs, once per
+page, and pages added one after another are handled with a pause. Civitai switches the notifications on by itself when you
+like a model, so a green thumb with an orange bell gives you a like without notifications. Links added any other way do
+nothing, and you have to be signed in to Civitai in that browser. The switches work on Civitai pages only.
+
 **Installation** (the code is in the `bridge` folder of this repository; the Chromium package and the signed Firefox
-`.xpi` are attached to the [Releases](../../releases)). Current versions: Firefox Add-ons 0.17.2, the Chromium package
-and the signed `.xpi` 0.17.0 (the same code; only the Firefox manifest differs).
+`.xpi` are attached to the [Releases](../../releases)). Current versions: Firefox Add-ons, the Chromium package
+and the signed `.xpi` 0.18.0 (the same code; only the Firefox manifest differs).
 
 - **Firefox 140 or newer (desktop), recommended:** install it from the Firefox Add-ons site:
   [Civitai Grabber Bridge](https://addons.mozilla.org/firefox/addon/civitai-grabber-bridge/) -> *Add to Firefox*.
